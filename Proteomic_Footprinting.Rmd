@@ -1,0 +1,323 @@
+---
+title: "Proteomics-Driven Transcription Factor Footprinting (DoRothEA)"
+author: "Regulatory Activity Analysis Pipeline"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "C:/Users/serife-ayaz/Desktop/OMV_Treatment_WCL") })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Proteomics-Driven Transcription Factor Footprinting
+
+Bu analiz, proteomik diferansiyel ekspresyon sonuçlarını girdi olarak alıp **DoRothEA regulon veri tabanı** ve **decoupleR (ulm: Univariate Linear Model)** algoritması ile hücredeki **Transkripsiyon Faktörlerinin (TF)** aktivasyon veya baskılanma durumlarını modeller.
+
+---
+
+## 1. Pipeline Configuration
+
+Bu script doğrudan `Proteomics_Pipeline.Rmd` tarafından üretilen `all_proteins_<Karşılaştırma>.csv` dosyalarını okur ve analiz eder.
+
+```{r config}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(decoupleR)
+library(dorothea)
+library(igraph)
+library(knitr)
+library(kableExtra)
+
+# --- PIPELINE CONFIGURATION ---
+data_dir <- "C:/Users/serife-ayaz/Desktop/OMV_Treatment_WCL"
+out_dir <- "C:/Users/serife-ayaz/Desktop/OMV_Treatment_WCL"
+
+# Karşılaştırmaların tespiti (contrast.txt dosyasından veya otomatik)
+contrast_file <- file.path(data_dir, "contrast.txt")
+if (file.exists(contrast_file)) {
+  contrast_df <- read.delim(contrast_file, stringsAsFactors = FALSE)
+  comp_names <- paste0(contrast_df[,1], "_vs_", contrast_df[,2])
+} else {
+  # Otomatik all_proteins dosyalarını tespit et
+  all_files <- list.files(data_dir, pattern = "^all_proteins_.*\\.csv$")
+  if (length(all_files) > 0) {
+    comp_names <- gsub("^all_proteins_|\\.csv$", "", all_files)
+  } else {
+    comp_names <- c("AD_vs_AY")
+  }
+}
+
+# ---------------------------------------------------------
+# 1. TF FOOTPRINT SETTINGS (DoRothEA)
+# ---------------------------------------------------------
+# DoRothEA regulon güven seviyeleri: A (En yüksek güvenilirlik), B, C, D, E. Önerilen: A, B, C
+TF_CONFIDENCE <- c("A", "B", "C")
+USE_OMNIPATH <- FALSE  # OmnipathR üzerinden canlı regulon çekmek için TRUE yapabilirsiniz
+
+# ---------------------------------------------------------
+# 2. RANKING METRIC FOR TF ANALYSIS
+# ---------------------------------------------------------
+# Options:
+# "stat"      : P-değeri ve logFC birleşimi pi-skoru (-log10(P.Value) * sign(logFC)) [Önerilen Standart]
+# "t"         : Limma / DEqMS t-istatistiği
+# "logFC"     : Saf Fold Change
+RANKING_METRIC <- "stat"
+
+# ---------------------------------------------------------
+# 3. GÖRSELLEŞTİRME VE EŞİK AYARLARI
+# ---------------------------------------------------------
+TF_PVAL_THRESHOLD   <- 0.05 # Anlamlı TF aktivitesi için p-değeri eşiği
+TOP_TF_PLOT_COUNT   <- 15   # Barplot grafiğinde gösterilecek en aktif TF sayısı
+TOP_NETWORK_TFS     <- 5    # Ağ grafiğinde yer alacak en güçlü merkez TF sayısı
+MAX_TARGETS_PER_TF  <- 12   # Her bir TF için ağ grafiğine bağlanacak maksimum hedef protein sayısı
+```
+
+---
+
+## 2. Load DoRothEA Regulons
+
+```{r load_regulons}
+# Fetch TF Regulons
+if (USE_OMNIPATH) {
+  cat("Fetching live DoRothEA regulons via OmnipathR...\n")
+  net_real <- decoupleR::get_dorothea(organism = "human", levels = TF_CONFIDENCE) %>% 
+    dplyr::rename(source = tf)
+} else {
+  data(dorothea_hs, package = "dorothea")
+  net_real <- dorothea_hs %>% 
+    filter(confidence %in% TF_CONFIDENCE) %>% 
+    dplyr::rename(source = tf)
+}
+
+cat("Loaded DoRothEA regulons with confidence levels:", paste(TF_CONFIDENCE, collapse = ", "), "\n")
+cat("Total regulatory interactions in database:", nrow(net_real), "\n")
+```
+
+---
+
+## 3. Transcription Factor Footprinting per Comparison
+
+```{r loop_footprinting, results='asis', fig.width=14, fig.height=11, dpi=300}
+for (comp_name in comp_names) {
+  cat("\n\n### Comparison:", comp_name, "\n\n")
+  
+  all_file <- file.path(data_dir, paste0("all_proteins_", comp_name, ".csv"))
+  if (!file.exists(all_file)) {
+    cat(paste("HATA: ", all_file, " dosyası bulunamadı, bu karşılaştırma atlanıyor.\n\n"))
+    next
+  }
+  
+  loaded_df <- read.csv(all_file, stringsAsFactors = FALSE, check.names = FALSE)
+  
+  # Kolon eşleştirmeleri
+  gene_col <- colnames(loaded_df)[grepl("^Gene$|^Gene\\.names$|^Gene names$", colnames(loaded_df), ignore.case = TRUE)][1]
+  if (is.na(gene_col)) gene_col <- colnames(loaded_df)[grepl("Gene", colnames(loaded_df), ignore.case = TRUE)][1]
+  
+  logfc_col <- colnames(loaded_df)[grepl("^logFC$|^log2FoldChange$", colnames(loaded_df), ignore.case = TRUE)][1]
+  if (is.na(logfc_col)) logfc_col <- colnames(loaded_df)[grepl("logFC", colnames(loaded_df), ignore.case = TRUE)][1]
+  
+  pval_col <- colnames(loaded_df)[grepl("^P\\.Value$|^pvalue$|^p\\.val$|^P\\.val$", colnames(loaded_df), ignore.case = TRUE)][1]
+  if (is.na(pval_col)) pval_col <- colnames(loaded_df)[grepl("P.*Val|p.*val", colnames(loaded_df), ignore.case = TRUE)][1]
+  
+  t_col <- colnames(loaded_df)[grepl("^t$|^sca\\.t$", colnames(loaded_df), ignore.case = TRUE)][1]
+  
+  # Gen isimlerini temizle (ilk sembolü al)
+  loaded_df[[gene_col]] <- sapply(strsplit(as.character(loaded_df[[gene_col]]), ";"), `[`, 1)
+  
+  # Eksik gen isimleri için Protein ID yedeği
+  pid_col <- colnames(loaded_df)[grepl("Protein.*ID", colnames(loaded_df), ignore.case = TRUE)][1]
+  if (!is.na(pid_col)) {
+    loaded_df[[pid_col]] <- sapply(strsplit(as.character(loaded_df[[pid_col]]), ";"), `[`, 1)
+    loaded_df[[gene_col]][is.na(loaded_df[[gene_col]]) | loaded_df[[gene_col]] == ""] <- loaded_df[[pid_col]][is.na(loaded_df[[gene_col]]) | loaded_df[[gene_col]] == ""]
+  }
+  
+  loaded_df <- loaded_df[!is.na(loaded_df[[gene_col]]) & loaded_df[[gene_col]] != "", ]
+  
+  # Sıralama skorunu hesapla
+  if (RANKING_METRIC == "logFC" || (RANKING_METRIC == "t" && is.na(t_col))) {
+    loaded_df$RankScore <- as.numeric(loaded_df[[logfc_col]])
+  } else if (RANKING_METRIC == "t" && !is.na(t_col)) {
+    loaded_df$RankScore <- as.numeric(loaded_df[[t_col]])
+  } else if (RANKING_METRIC == "stat") {
+    pval_vec <- as.numeric(loaded_df[[pval_col]])
+    lfc_vec <- as.numeric(loaded_df[[logfc_col]])
+    pval_vec[is.na(pval_vec) | pval_vec == 0] <- 1e-300
+    loaded_df$RankScore <- -log10(pval_vec) * sign(lfc_vec)
+  } else {
+    loaded_df$RankScore <- as.numeric(loaded_df[[logfc_col]])
+  }
+  
+  # Duplicate genleri ele (mutlak skoru en yüksek olanı tut)
+  loaded_df <- loaded_df[order(abs(loaded_df$RankScore), decreasing = TRUE), ]
+  loaded_df <- loaded_df[!duplicated(loaded_df[[gene_col]]), ]
+  
+  ranked_vec <- loaded_df$RankScore
+  names(ranked_vec) <- loaded_df[[gene_col]]
+  ranked_vec <- sort(ranked_vec, decreasing = TRUE)
+  ranked_vec <- ranked_vec[!is.na(ranked_vec)]
+  
+  cat(paste0("- Analize dahil edilen toplam protein sayısı: ", length(ranked_vec), "\n"))
+  cat(paste0("- Kullanılan sıralama metriği: ", RANKING_METRIC, "\n\n"))
+  
+  # ---------------------------------------------------------
+  # DoRothEA / decoupleR TF Activity Inference (run_ulm)
+  # ---------------------------------------------------------
+  mat <- matrix(ranked_vec, ncol = 1)
+  rownames(mat) <- names(ranked_vec)
+  colnames(mat) <- "RankScore"
+  
+  tf_acts <- decoupleR::run_ulm(mat = mat, network = net_real, .source = "source", .target = "target", .mor = "mor")
+  
+  sig_tfs <- tf_acts %>% 
+    filter(p_value < TF_PVAL_THRESHOLD) %>% 
+    arrange(desc(abs(score)))
+  
+  if (nrow(sig_tfs) > 0) {
+    sig_tfs$Status <- ifelse(sig_tfs$score > 0, "Activated", "Repressed")
+    
+    # CSV Olarak Kaydet
+    write.csv(sig_tfs, file.path(out_dir, paste0("DoRothEA_TF_Activities_", comp_name, ".csv")), row.names = FALSE)
+    
+    cat("\n#### Inferred Significant Transcription Factors Table\n\n")
+    print(kable(head(sig_tfs, 20), format = "markdown", digits = 4))
+    cat("\n\n")
+    
+    # ---------------------------------------------------------
+    # TF Activity Barplot
+    # ---------------------------------------------------------
+    cat("\n#### TF Activity Barplot\n\n")
+    tf_plot_df <- head(sig_tfs, TOP_TF_PLOT_COUNT)
+    
+    p_tf <- ggplot(tf_plot_df, aes(x = reorder(source, abs(score)), y = score, fill = Status)) +
+      geom_bar(stat = "identity", color = "black", width = 0.7, alpha = 0.9) +
+      coord_flip() +
+      scale_fill_manual(values = c("Activated" = "#E64B35", "Repressed" = "#4DBBD5")) +
+      theme_minimal(base_size = 15) +
+      labs(title = paste("Top Inferred TF Activities -", comp_name),
+           x = "Transcription Factor",
+           y = "Activity Score (ulm)") +
+      theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+            axis.text.y = element_text(face = "bold", size = 13),
+            axis.title = element_text(face = "bold", size = 14),
+            legend.title = element_text(face = "bold"))
+    
+    print(p_tf)
+    ggsave(file.path(out_dir, paste0("DoRothEA_TF_Activity_Plot_", comp_name, ".png")), plot = p_tf, width = 10, height = 7, dpi = 300)
+    cat("\n\n")
+    
+    # ---------------------------------------------------------
+    # TF-Target Regulatory Interaction Network (igraph)
+    # ---------------------------------------------------------
+    cat("\n#### TF-Target Regulatory Interaction Network\n\n")
+    top_tfs <- head(sig_tfs$source, TOP_NETWORK_TFS)
+    
+    tf_edges <- net_real %>% 
+      mutate(source = as.character(source), target = as.character(target)) %>%
+      filter(source %in% top_tfs) %>% 
+      filter(target %in% names(ranked_vec))
+    
+    if (nrow(tf_edges) > 0) {
+      tf_edges$Target_Score <- ranked_vec[tf_edges$target]
+      
+      # Her TF için mutlak hedef skoru en yüksek olanları seç
+      tf_edges <- tf_edges %>% 
+        group_by(source) %>% 
+        slice_max(order_by = abs(Target_Score), n = MAX_TARGETS_PER_TF, with_ties = FALSE) %>% 
+        ungroup()
+      
+      # igraph'ın source ve target sütunlarını ilk 2 sıraya alması zorunludur
+      tf_edges <- tf_edges %>% dplyr::select(source, target, mor, Target_Score)
+      
+      net_graph <- graph_from_data_frame(tf_edges, directed = TRUE)
+      V(net_graph)$type <- ifelse(V(net_graph)$name %in% top_tfs, "TF", "Target")
+      
+      max_abs <- max(abs(tf_edges$Target_Score), na.rm = TRUE)
+      if (is.na(max_abs) || max_abs == 0) max_abs <- 1
+      color_pal <- colorRampPalette(c("#4DBBD5", "white", "#E64B35"))(100)
+      
+      node_colors <- sapply(V(net_graph)$name, function(nm) {
+        if (nm %in% top_tfs) {
+          sc <- sig_tfs$score[sig_tfs$source == nm]
+          if (length(sc) > 0 && sc[1] > 0) return("darkred") else return("darkblue")
+        } else {
+          sc <- ranked_vec[nm]
+          if (length(sc) == 0 || is.na(sc)) return("gray90")
+          idx <- round(((sc[1] + max_abs) / (2 * max_abs)) * 99) + 1
+          idx <- max(1, min(100, idx))
+          return(color_pal[idx])
+        }
+      })
+      
+      V(net_graph)$color <- node_colors
+      V(net_graph)$shape <- ifelse(V(net_graph)$type == "TF", "none", "circle")
+      V(net_graph)$size  <- ifelse(V(net_graph)$type == "TF", 0, 16)
+      V(net_graph)$label.cex <- ifelse(V(net_graph)$type == "TF", 1.5, 0.85)
+      V(net_graph)$label.font <- ifelse(V(net_graph)$type == "TF", 2, 2)
+      
+      label_colors <- sapply(V(net_graph)$name, function(nm) {
+        if (nm %in% top_tfs) {
+          sc <- sig_tfs$score[sig_tfs$source == nm]
+          if (length(sc) > 0 && sc[1] > 0) return("darkred") else return("darkblue")
+        } else {
+          return("black")
+        }
+      })
+      V(net_graph)$label.color <- label_colors
+      
+      # Kenar renkleri (mor > 0: aktivatör / gri, mor < 0: represör / kırmızı)
+      E(net_graph)$color <- ifelse(tf_edges$mor > 0, "gray60", "tomato")
+      E(net_graph)$arrow.size <- 0.4
+      E(net_graph)$width <- 1.3
+      
+      # Çizim ve PNG kaydetme
+      png(file.path(out_dir, paste0("DoRothEA_TF_Network_", comp_name, ".png")), width = 12, height = 10, units = "in", res = 300)
+      par(mar = c(3, 2, 4, 2), xpd = TRUE)
+      plot(net_graph, layout = layout_with_fr(net_graph),
+           main = paste("TF-Target Interaction Network -", comp_name))
+      legend("topleft", legend = c("Activated TF", "Repressed TF"), 
+             text.col = c("darkred", "darkblue"), bty = "n", cex = 1.1, text.font = 2)
+      legend_title <- if(RANKING_METRIC == "t") "Target t-stat" else if(RANKING_METRIC == "logFC") "Target logFC" else "Target Rank Score"
+      legend("bottomleft", legend = c(paste0("Up (+", round(max_abs, 1), ")"), "Mild Up", "Neutral (0)", "Mild Down", paste0("Down (-", round(max_abs, 1), ")")),
+             col = c("#E64B35", color_pal[75], "gray90", color_pal[25], "#4DBBD5"), 
+             pch = 19, pt.cex = 2.2, bty = "n", title = legend_title, cex = 0.95, title.col = "black", text.col = "gray20")
+      legend("bottomright", legend = c("Activates Target (mor > 0)", "Represses Target (mor < 0)"),
+             col = c("gray60", "tomato"), lty = 1, lwd = 3, bty = "n", title = "Mode of Regulation", cex = 0.95)
+      dev.off()
+      
+      # Rmd içinde bas
+      par(mar = c(3, 2, 4, 2), xpd = TRUE)
+      plot(net_graph, layout = layout_with_fr(net_graph),
+           main = paste("TF-Target Interaction Network -", comp_name))
+      legend("topleft", legend = c("Activated TF", "Repressed TF"), 
+             text.col = c("darkred", "darkblue"), bty = "n", cex = 1.1, text.font = 2)
+      legend("bottomleft", legend = c(paste0("Up (+", round(max_abs, 1), ")"), "Mild Up", "Neutral (0)", "Mild Down", paste0("Down (-", round(max_abs, 1), ")")),
+             col = c("#E64B35", color_pal[75], "gray90", color_pal[25], "#4DBBD5"), 
+             pch = 19, pt.cex = 2.2, bty = "n", title = legend_title, cex = 0.95, title.col = "black", text.col = "gray20")
+      legend("bottomright", legend = c("Activates Target (mor > 0)", "Represses Target (mor < 0)"),
+             col = c("gray60", "tomato"), lty = 1, lwd = 3, bty = "n", title = "Mode of Regulation", cex = 0.95)
+      
+    } else {
+      cat("Ağ çizimi için yeterli hedef protein eşleşmesi bulunamadı.\n")
+    }
+  } else {
+    cat("Bu karşılaştırma için istatistiksel olarak anlamlı transkripsiyon faktörü aktivitesi bulunamadı.\n")
+  }
+  cat("\n\n")
+}
+```
+
+---
+
+## Session Info
+```{r}
+sessionInfo()
+```

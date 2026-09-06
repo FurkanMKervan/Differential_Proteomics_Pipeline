@@ -1,0 +1,1020 @@
+---
+title: "Proteomic Analaysis Pipeline for Fragpipe and MaxQuant"
+author: "Furkan M. Kervan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "C:/Users/serife-ayaz/Desktop/AORT_Final") })
+---
+
+
+# Proteomic Analysis
+
+This is a pipeline for **differential expression** analysis in **proteomics** and contains 5 parts. To continue further analysis you need to choose **normalization** technique, **imputation** method, **minimum razor peptide** amount, **min MSMS** count, **filtration**. Also for DEA you need to choose **logFC** value and significant value of **adjusted p value**.
+
+* Configuration, Data & Packages
+* Data Processing
+* Quality Control (QC)
+  + PCA Analysis for LFQ intensities
+  + Relative Amount of Contaminants
+  + Number of Identified Proteins
+  + LFQ (log2) Intensities BoxPlot
+  + Correlation Plot LFQ Intensities
+  + Overlap Heatmap
+* Differential Expression Analysis
+  + Volcano Plot
+  + HeatMap
+
+---
+
+## Part 1: Configuration & Data Loading
+First thing first you need to define your working director and you need to have **proteinGroups.txt**, **Design.txt** and **Contrast.txt** as tab delimetted text file. In here you need to define your configuration values like normalization, imputation etc. Also you can define **order of groups** in the graphs, **splitting** heatmap into the groups
+
+* normalization_method = "vsn"      # Options: "none", "quantile", "vsn", "median.centering"
+* imputation_method = "none"        # Options: "normal", "min", "global", "none"
+* min_razor_peptides = 2            
+* min_msms_count = 3                
+* min_valid_percent = 0.70          
+* logFC_threshold = 0.54            # 1.5x up or down regulate           
+* adj_pval_threshold = 0.05
+* min_valid_type = "percent"        # Options: "percent", "count"
+* min_valid_percent = 0.70          # Used if min_valid_type == "percent", recommended: 70%
+* dea_method = "limma"              # Options: "limma", "deqms"
+* deqms_count_col = "Peptides"      # Options: "Peptide", "MS/MS count"
+* run_logistic_regression = FALSE   # If TRUE: performs logistic regression biomarker analysis
+```{r config, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(limma)
+library(ggplot2)
+library(pheatmap)
+library(ggrepel)
+library(vsn)
+library(clusterProfiler)
+library(DEqMS)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(knitr)
+library(kableExtra)
+library(pROC)
+library(readxl)
+library(ggvenn)
+library(ggsci)
+
+# --- PIPELINE CONFIGURATION ---
+data_dir <- "C:/Users/serife-ayaz/Desktop/AORT_Final" # You should change directory name
+out_dir <- "C:/Users/serife-ayaz/Desktop/AORT_Final"  # You should change directory name
+normalization_method <- "vsn" # Options: "none", "quantile", "vsn", "median.centering"
+imputation_method <- "none" # Options: "normal", "min", "global", "none"
+min_razor_peptides <- 2 # Recommended: 2
+min_msms_count <- 3 # Recommnded: 3
+min_valid_type <- "percent" # Options: "percent", "count"
+min_valid_percent <- 0.70 # Used if min_valid_type == "percent", recommended: 70%
+min_valid_count <- 1 # Used if min_valid_type == "count", recommended 2
+logFC_threshold <- 0.54 # 0.54 = 1.5x fold change, 0.413 1.33xFC, 0.263 1.2xFC
+adj_pval_threshold <- 0.05
+p_val_type <- "adj_pvalue" # Options: "adj_pvalue", "pvalue"
+split_heatmap <- FALSE # Recommended: False
+heatmap_exclude_groups <- c() # you can remove specific group from heatmap just write column names in your Design_.txt like c("Control_1","Control2")
+dea_method <- "deqms" # Options: "limma", "deqms", it is used for more powerful statistical analysis, recommended limma at first
+deqms_count_col <- "Peptides" # Only active if dea_method="deqms". Common Options: "Peptides", "MS/MS count", "Razor + squared peptides"
+group_order <- c() # You can order your group just writing names
+draw_pca_ellipse <- FALSE # Options: TRUE, FALSE. Set to TRUE to draw dashed ellipses around groups in PCA, FALSE to skip.
+# ------------------------------
+
+proteinGroups_raw <- read.delim(file.path(data_dir, "proteinGroups.txt"), stringsAsFactors = FALSE, check.names = FALSE)
+design <- read.delim(file.path(data_dir, "design.txt"), stringsAsFactors = FALSE)
+contrast <- read.delim(file.path(data_dir, "contrast.txt"), stringsAsFactors = FALSE)
+
+# Define global NPG colors for consistent groups (e.g. AS, AR)
+unique_groups_global <- unique(design$groups)
+npg_colors <- ggsci::pal_npg("nrc")(max(length(unique_groups_global), 3))[1:length(unique_groups_global)]
+names(npg_colors) <- unique_groups_global
+```
+
+---
+
+## Part 2: Preprocessing & Filtration
+
+Proteins are filtered in this step according to configuartion filter paramateres. You can track proteins amount in the table.
+
+```{r preprocessing, message=FALSE, warning=FALSE}
+df <- proteinGroups_raw
+
+# Filter tracking data frame
+filter_tracking <- data.frame(Step = "Initial Proteins", Count = nrow(df))
+
+# 1. Reverse & Contaminant Filtresi
+if ("Reverse" %in% colnames(df)) df <- df[is.na(df$Reverse) | df$Reverse != "+", ]
+if ("Potential contaminant" %in% colnames(df)) df <- df[is.na(df$`Potential contaminant`) | df$`Potential contaminant` != "+", ]
+if ("Only identified by site" %in% colnames(df)) df <- df[is.na(df$`Only identified by site`) | df$`Only identified by site` != "+", ]
+
+filter_tracking <- rbind(filter_tracking, data.frame(Step = "After Reverse/Contaminant Removal", Count = nrow(df)))
+
+# Number of Identified Proteins
+sample_names <- design$samples
+
+# Dynamically and robustly detect intensity columns in proteinGroups
+find_intensity_cols <- function(df, sample_names) {
+  # 1. Try "LFQ intensity "
+  lfq_cols <- paste0("LFQ intensity ", sample_names)
+  if (all(lfq_cols %in% colnames(df))) {
+    mat <- as.matrix(df[, lfq_cols])
+    if (sum(mat != 0, na.rm = TRUE) > 0) {
+      return(list(cols = lfq_cols, type = "LFQ intensity"))
+    }
+  }
+  
+  # 2. Try "Intensity "
+  int_cols <- paste0("Intensity ", sample_names)
+  if (all(int_cols %in% colnames(df))) {
+    mat <- as.matrix(df[, int_cols])
+    if (sum(mat != 0, na.rm = TRUE) > 0) {
+      return(list(cols = int_cols, type = "Intensity"))
+    }
+  }
+  
+  # 3. Try "iBAQ "
+  ibaq_cols <- paste0("iBAQ ", sample_names)
+  if (all(ibaq_cols %in% colnames(df))) {
+    mat <- as.matrix(df[, ibaq_cols])
+    if (sum(mat != 0, na.rm = TRUE) > 0) {
+      return(list(cols = ibaq_cols, type = "iBAQ"))
+    }
+  }
+  
+  # 4. Exact match
+  if (all(sample_names %in% colnames(df))) {
+    return(list(cols = sample_names, type = "Exact"))
+  }
+  
+  # 5. Fuzzy match (ends with sample name)
+  matched_cols <- c()
+  for (s in sample_names) {
+    found <- colnames(df)[grepl(paste0("(^|[^a-zA-Z0-9])", s, "$"), colnames(df))]
+    if (length(found) > 0) {
+      matched_cols <- c(matched_cols, found[1])
+    }
+  }
+  if (length(matched_cols) == length(sample_names)) {
+    return(list(cols = matched_cols, type = "Fuzzy"))
+  }
+  
+  # Fallback to LFQ if nothing else works
+  return(list(cols = lfq_cols, type = "LFQ intensity"))
+}
+
+detected <- find_intensity_cols(df, sample_names)
+lfq_cols <- detected$cols
+cat(paste("Automatically detected intensity column type:", detected$type, "\n"))
+
+raw_intensity <- as.matrix(df[, lfq_cols])
+raw_intensity[raw_intensity == 0] <- NA
+identified_per_sample_raw <- colSums(!is.na(raw_intensity))
+
+# 2. Razor ve MS/MS Filter
+razor_col <- grep("Razor", colnames(df), value = TRUE, ignore.case = TRUE)
+msms_col <- grep("MS/MS count", colnames(df), value = TRUE, ignore.case = TRUE)
+
+if (length(razor_col) > 0) {
+  keep_razor <- apply(df[, razor_col, drop = FALSE], 1, function(x) any(x >= min_razor_peptides, na.rm = TRUE))
+  df <- df[keep_razor, ]
+}
+if (length(msms_col) > 0) {
+  # if one of ms/ms col contains maximum value bigger than threhsold kept it
+  keep_msms <- apply(df[, msms_col, drop = FALSE], 1, function(x) any(x >= min_msms_count, na.rm = TRUE))
+  df <- df[keep_msms, ]
+}
+
+filter_tracking <- rbind(filter_tracking, data.frame(Step = "After Razor and MS/MS Filter", Count = nrow(df)))
+
+# 3. LFQ Matrix and Normalization
+intensity_matrix <- as.matrix(df[, lfq_cols])
+intensity_matrix[intensity_matrix == 0] <- NA
+
+if (nrow(intensity_matrix) == 0 || all(is.na(intensity_matrix))) {
+  stop("Error: The intensity matrix is completely empty (all values are NA or 0). Please verify that your sample names in design.txt match the column headers in proteinGroups.txt exactly, or check if the selected intensity type contains non-zero values in your dataset.")
+}
+
+if (normalization_method == "none") {
+  norm_matrix <- log2(intensity_matrix)
+} else if (normalization_method == "quantile") {
+  norm_matrix <- preprocessCore::normalize.quantiles(intensity_matrix)
+  dimnames(norm_matrix) <- dimnames(intensity_matrix)
+  norm_matrix <- log2(norm_matrix)
+} else if (normalization_method == "median.centering") {
+  log2_temp <- log2(intensity_matrix)
+  global_median <- median(log2_temp, na.rm = TRUE)
+  col_medians <- apply(log2_temp, 2, median, na.rm = TRUE)
+  norm_matrix <- sweep(log2_temp, 2, col_medians, FUN = "-")
+  norm_matrix <- norm_matrix + global_median
+} else {
+  if (nrow(intensity_matrix) < 42) {
+    stop("Error: Too few proteins (less than 42) remaining to perform VSN normalization. Please check your filtering thresholds (min_razor_peptides, min_msms_count) or verify that your sample names match the column headers in proteinGroups.txt.")
+  }
+  vsn_model <- vsn::vsn2(intensity_matrix)
+  norm_matrix <- predict(vsn_model, newdata = intensity_matrix)
+}
+
+log2_matrix <- norm_matrix
+colnames(log2_matrix) <- sample_names
+
+# 4. Valid Values Filter
+keep_rows <- apply(log2_matrix, 1, function(x) {
+  counts <- tapply(x, design$groups, function(g) sum(!is.na(g)))
+  group_sizes <- tapply(x, design$groups, length)
+
+  if (min_valid_type == "percent") {
+    any((counts / group_sizes) >= min_valid_percent)
+  } else {
+    any(counts >= min_valid_count)
+  }
+})
+
+# Find the exact count column dynamically if DEqMS is used
+actual_count_col <- NULL
+if (dea_method == "deqms") {
+  # Starts with search to catch "Peptides", "MS/MS count" etc.
+  matched_cols <- grep(paste0("^", deqms_count_col), colnames(df), value = TRUE, ignore.case = TRUE)
+  if (length(matched_cols) == 0) {
+    stop(paste("Count column '", deqms_count_col, "' not found in data for DEqMS analysis!"))
+  }
+  actual_count_col <- matched_cols[1]
+  df_filtered <- df[keep_rows, c("Protein IDs", "Gene names", actual_count_col, lfq_cols)]
+} else {
+  df_filtered <- df[keep_rows, c("Protein IDs", "Gene names", lfq_cols)]
+}
+filter_tracking <- rbind(filter_tracking, data.frame(Step = paste0("After Valid Values Filter (", min_valid_type, ")"), Count = nrow(df_filtered)))
+
+# First gene name for better readability in Graphs
+df_filtered$`Gene names` <- sapply(strsplit(as.character(df_filtered$`Gene names`), ";"), `[`, 1)
+df_filtered$`Protein IDs` <- sapply(strsplit(as.character(df_filtered$`Protein IDs`), ";"), `[`, 1)
+
+log2_filtered <- log2_matrix[keep_rows, ]
+log2_filtered_pre_imputation <- log2_filtered
+
+# 5. Imputation
+if (imputation_method == "normal") {
+  for (j in 1:ncol(log2_filtered)) {
+    col_na <- is.na(log2_filtered[, j])
+    if (any(col_na)) {
+      mean_val <- mean(log2_filtered[, j], na.rm = TRUE)
+      sd_val <- sd(log2_filtered[, j], na.rm = TRUE)
+      log2_filtered[col_na, j] <- rnorm(sum(col_na), mean = (mean_val - 1.8 * sd_val), sd = (0.3 * sd_val))
+    }
+  }
+} else if (imputation_method == "min") {
+  for (j in 1:ncol(log2_filtered)) {
+    col_na <- is.na(log2_filtered[, j])
+    if (any(col_na)) log2_filtered[col_na, j] <- min(log2_filtered[, j], na.rm = TRUE)
+  }
+} else if (imputation_method == "global") {
+  log2_filtered[is.na(log2_filtered)] <- min(log2_filtered, na.rm = TRUE)
+}
+
+kable(filter_tracking, caption = "Protein Count After Each Filtration Step") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+## Part 3: Quality Control (QC)
+
+### 3.1. PCA Analysis
+```{r qc_pca_combined, echo=FALSE, warning=FALSE, message=FALSE}
+# 1. Raw LFQ (Log2)
+mat_raw_lfq <- as.matrix(df[keep_rows, lfq_cols])
+mat_raw_lfq[mat_raw_lfq == 0] <- NA
+mat_log2_lfq <- log2(mat_raw_lfq)
+
+# 2. iBAQ (Log2)
+ibaq_cols <- paste0("iBAQ ", sample_names)
+mat_log2_ibaq <- NULL
+if (all(ibaq_cols %in% colnames(df))) {
+  ibaq_matrix <- as.matrix(df[keep_rows, ibaq_cols])
+  ibaq_matrix[ibaq_matrix == 0] <- NA
+  mat_log2_ibaq <- log2(ibaq_matrix)
+}
+
+# 3. Imputed (based on Normalized)
+# Amica'nın arka planda PCA çizebilmek için yaptığı muhtemel "downshifted normal" imputation simülasyonu
+mat_imputed <- log2_filtered
+for (j in 1:ncol(mat_imputed)) {
+  col_na <- is.na(mat_imputed[, j])
+  if (any(col_na)) {
+    mean_val <- mean(mat_imputed[, j], na.rm = TRUE)
+    sd_val <- sd(mat_imputed[, j], na.rm = TRUE)
+    mat_imputed[col_na, j] <- rnorm(sum(col_na), mean = (mean_val - 1.8 * sd_val), sd = (0.3 * sd_val))
+  }
+}
+
+# 4. Normalized
+mat_norm <- log2_filtered
+
+# Function to calculate PCA and format for ggplot
+run_pca_for_plot <- function(mat, name) {
+  if (is.null(mat)) return(NULL)
+  mat_clean <- na.omit(mat)
+  if (nrow(mat_clean) > 2 && ncol(mat_clean) > 2) {
+    pca_res <- prcomp(t(mat_clean), center = TRUE, scale. = FALSE)
+    pc1_var <- round(summary(pca_res)$importance[2, 1] * 100, 1)
+    pc2_var <- round(summary(pca_res)$importance[2, 2] * 100, 1)
+    
+    df_pca <- data.frame(
+      PC1 = pca_res$x[, 1], 
+      PC2 = pca_res$x[, 2], 
+      Group = design$groups, 
+      Sample = design$samples,
+      Type = paste0(name, "\n(PC1: ", pc1_var, "%, PC2: ", pc2_var, "%)")
+    )
+    return(df_pca)
+  }
+  return(NULL)
+}
+
+df_pca_lfq <- run_pca_for_plot(mat_log2_lfq, "1. Log2 LFQ")
+df_pca_ibaq <- run_pca_for_plot(mat_log2_ibaq, "2. iBAQ")
+df_pca_norm <- run_pca_for_plot(mat_norm, paste0("3. Normalized (", normalization_method, ")"))
+df_pca_imp <- run_pca_for_plot(mat_imputed, "4. Imputed")
+
+pca_all_list <- list(df_pca_lfq, df_pca_ibaq, df_pca_norm, df_pca_imp)
+pca_all_list <- pca_all_list[!sapply(pca_all_list, is.null)]
+df_pca_all <- do.call(rbind, pca_all_list)
+
+# Type factor ordering to maintain plot order
+types <- unique(df_pca_all$Type)
+df_pca_all$Type <- factor(df_pca_all$Type, levels = types)
+
+p_pca_all <- ggplot(df_pca_all, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = npg_colors) +
+  facet_wrap(~ Type, scales = "free") +
+  theme_minimal() +
+  labs(x = "PC1", y = "PC2")
+
+if (draw_pca_ellipse) {
+  p_pca_all <- p_pca_all + stat_ellipse(aes(group = Group), type = "norm", linetype = "dashed", alpha = 0.5)
+}
+
+print(p_pca_all)
+ggsave(file.path(out_dir, "QC_PCA_Combined_Plot.png"), plot = p_pca_all, width = 10, height = 8, dpi = 300)
+
+# Save individual PCA plots
+for (pca_type in types) {
+  df_single <- df_pca_all[df_pca_all$Type == pca_type, ]
+  
+  clean_title <- strsplit(as.character(pca_type), "\n")[[1]][1]
+  clean_name <- gsub("[^A-Za-z0-9_]", "_", clean_title)
+  clean_name <- gsub("_+", "_", clean_name)
+  clean_name <- sub("^_|_$", "", clean_name)
+  
+  p_single <- ggplot(df_single, aes(x = PC1, y = PC2, color = Group)) +
+    geom_point(size = 3, alpha = 0.8) +
+    scale_color_manual(values = npg_colors) +
+    labs(title = paste("Principle Component Analysis"), x = "PC1", y = "PC2") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 18, hjust = 0.5))
+    
+  if (draw_pca_ellipse) {
+    p_single <- p_single + stat_ellipse(aes(group = Group), type = "norm", linetype = "dashed", alpha = 0.5)
+  }
+    
+  ggsave(file.path(out_dir, paste0("QC_PCA_", clean_name, ".png")), plot = p_single, width = 8, height = 6, dpi = 300)
+}
+```
+
+
+Different groups should cluster **seperatly** for here AD and AY clustered seperatly (AD not that much good)
+
+### 3.2. Relative Amount of Contaminants
+```{r qc_contaminants, echo=FALSE, warning=FALSE, message=FALSE, eval=FALSE}
+ibaq_cols <- paste0("iBAQ ", sample_names)
+
+ibaq_cols[ibaq_cols == "iBAQ D_4_2"]  <- "iBAQ D_4_2"
+
+if (all(ibaq_cols %in% colnames(proteinGroups_raw))) {
+  df_ibaq <- proteinGroups_raw[, c("Reverse", ibaq_cols)]
+
+  category <- rep("Valid", nrow(df_ibaq))
+  if ("Decoy" %in% colnames(df_ibaq)) category[df_ibaq$Reverse == "+"] <- "Decoy"
+  if ("Potential contaminant" %in% colnames(df_ibaq)) category[df_ibaq$`Potential contaminant` == "+"] <- "Contaminant"
+  df_ibaq$Category <- category
+
+  ibaq_long <- df_ibaq %>%
+    dplyr::select(Category, all_of(ibaq_cols)) %>%
+    pivot_longer(cols = all_of(ibaq_cols), names_to = "Sample", values_to = "iBAQ") %>%
+    mutate(Sample = gsub("iBAQ ", "", Sample))
+
+  ibaq_summary <- ibaq_long %>%
+    group_by(Sample, Category) %>%
+    summarise(Total_iBAQ = sum(as.numeric(iBAQ), na.rm = TRUE), .groups = "drop") %>%
+    group_by(Sample) %>%
+    mutate(Percentage = Total_iBAQ / sum(Total_iBAQ, na.rm = TRUE) * 100) %>%
+    left_join(design, by = c("Sample" = "samples"))
+
+  p_cont <- ggplot(ibaq_summary, aes(x = Sample, y = Percentage, fill = Category)) +
+    geom_bar(stat = "identity", position = "stack", color = "black", size = 0.2) +
+    scale_fill_manual(values = c("Valid" = "#1f77b4", "Contaminant" = "#d62728")) +
+    theme_minimal() +
+    labs(title = "Relative Amount of Contaminants", y = "iBAQ Intensity (%)", x = "") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+  print(p_cont)
+  ggsave(file.path(out_dir, "QC_Contaminants_iBAQ.png"), plot = p_cont, width = 10, height = 6, dpi = 300)
+} else {
+  cat("iBAQ kolonları bulunamadı, bu grafik çizilemiyor.\n")
+}
+```
+
+### 3.3. Number of Identified Proteins
+```{r qc_identified, echo=FALSE, warning=FALSE, message=FALSE}
+qc_samples <- data.frame(Sample = sample_names, Group = design$groups, Identified_Proteins = identified_per_sample_raw)
+
+p_id <- ggplot(qc_samples, aes(x = Sample, y = Identified_Proteins, fill = Group)) +
+  geom_bar(stat = "identity", color = "black", alpha = 0.8) +
+  scale_fill_manual(values = npg_colors) +
+  theme_minimal() +
+  labs(title = "Number of Identified Proteins", x = "", y = "Identified Proteins") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+print(p_id)
+ggsave(file.path(out_dir, "QC_Identified_Proteins.png"), plot = p_id, width = 10, height = 6, dpi = 300)
+```
+
+### 3.3.b Venn Diagram - Proteome Overlap
+```{r qc_venn, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+unique_groups <- unique(design$groups)
+expressed_lists <- list()
+
+for (grp in unique_groups) {
+  grp_samples <- design$samples[design$groups == grp]
+  mat <- log2_filtered_pre_imputation[, grp_samples, drop = FALSE]
+  
+  valid_ratio <- rowSums(!is.na(mat)) / ncol(mat)
+  if (min_valid_type == "percent") {
+    expressed_idx <- valid_ratio >= min_valid_percent
+  } else {
+    expressed_idx <- rowSums(!is.na(mat)) >= min_valid_count
+  }
+  
+  proteins_expressed <- df_filtered$`Protein IDs`[expressed_idx]
+  proteins_expressed <- proteins_expressed[!is.na(proteins_expressed) & proteins_expressed != ""]
+  expressed_lists[[grp]] <- unique(proteins_expressed)
+}
+
+# Define dynamic colors based on the global NPG palette
+my_colors <- unname(npg_colors[unique_groups])
+
+p_venn <- ggvenn(
+  expressed_lists,
+  show_percentage = FALSE,
+  show_elements = FALSE,
+  fill_color = my_colors,
+  fill_alpha = 0.55,
+  stroke_size = 1.4,
+  text_size = 6,
+  set_name_size = 6
+) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 12
+    )
+  )
+
+print(p_venn)
+
+ggsave(
+  file.path(out_dir, "QC_Venn_Expressed_Proteome.png"),
+  p_venn,
+  width = 9,
+  height = 9,
+  dpi = 600,
+  bg = "white"
+)
+
+# Summary Table
+cat("\n\n#### Proteome Overlap Summary\n\n")
+
+all_genes <- unique(unlist(expressed_lists))
+common_genes <- Reduce(intersect, expressed_lists)
+
+overlap_summary <- data.frame(
+  Category = c(paste0("Only in ", names(expressed_lists)), "Common in All Groups", "Total Unique"),
+  Count = c(
+    sapply(names(expressed_lists), function(g) {
+      others <- setdiff(names(expressed_lists), g)
+      length(setdiff(expressed_lists[[g]], unique(unlist(expressed_lists[others]))))
+    }),
+    length(common_genes),
+    length(all_genes)
+  )
+)
+print(kable(overlap_summary, format = "markdown"))
+cat("\n\n")
+```
+
+### 3.4. LFQ (log2) Intensities BoxPlot (Pre-Imputation)
+```{r qc_boxplot, echo=FALSE, warning=FALSE, message=FALSE}
+boxplot_data <- pivot_longer(as.data.frame(log2_filtered_pre_imputation), cols = everything(), names_to = "Sample", values_to = "Intensity")
+boxplot_data$Group <- design$groups[match(boxplot_data$Sample, design$samples)]
+
+p_box <- ggplot(boxplot_data, aes(x = Sample, y = Intensity, fill = Group)) +
+  geom_boxplot(outlier.size = 0.5, na.rm = TRUE) +
+  scale_fill_manual(values = npg_colors) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = paste("Intensities BoxPlot (", normalization_method, ") - Pre-Imputation"), x = "Samples", y = "Normalized Intensity")
+
+print(p_box)
+ggsave(file.path(out_dir, "QC_Intensities_Boxplot_Pre.png"), plot = p_box, width = 10, height = 6, dpi = 300)
+```
+
+### 3.4.b LFQ Intensities BoxPlot (Post-Imputation)
+```{r qc_boxplot_post, echo=FALSE, warning=FALSE, message=FALSE}
+boxplot_data_post <- pivot_longer(as.data.frame(log2_filtered), cols = everything(), names_to = "Sample", values_to = "Intensity")
+boxplot_data_post$Group <- design$groups[match(boxplot_data_post$Sample, design$samples)]
+
+p_box_post <- ggplot(boxplot_data_post, aes(x = Sample, y = Intensity, fill = Group)) +
+  geom_boxplot(outlier.size = 0.5, na.rm = TRUE) +
+  scale_fill_manual(values = npg_colors) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = paste("Intensities BoxPlot (", imputation_method, " imputed)"), x = "Samples", y = "Imputed Intensity")
+
+print(p_box_post)
+ggsave(file.path(out_dir, "QC_Intensities_Boxplot_Post.png"), plot = p_box_post, width = 10, height = 6, dpi = 300)
+```
+
+### 3.5. Correlation Plot LFQ Intensities
+```{r qc_correlation, echo=FALSE, warning=FALSE, message=FALSE, eval=FALSE}
+cor_mat <- cor(log2_filtered, use = "pairwise.complete.obs")
+anno_col <- data.frame(Group = design$groups)
+rownames(anno_col) <- colnames(log2_filtered)
+
+# Sadece kaydet
+pheatmap(cor_mat,
+  annotation_col = anno_col,
+  annotation_colors = list(Group = npg_colors),
+  main = "Correlation Plot LFQ Intensities",
+  display_numbers = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  filename = file.path(out_dir, "QC_Correlation_Plot.png"),
+  width = 8, height = 8
+)
+
+# RMarkdown içerisinde ekrana bas
+pheatmap(cor_mat,
+  annotation_col = anno_col,
+  annotation_colors = list(Group = npg_colors),
+  main = "Correlation Plot LFQ Intensities",
+  display_numbers = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100)
+)
+
+
+knitr::include_graphics(file.path(out_dir, "QC_Correlation_Plot.png"))
+```
+
+### 3.6. Overlap Heatmap
+```{r qc_overlap, echo=FALSE, warning=FALSE, message=FALSE, eval=FALSE}
+bin_mat <- !is.na(log2_filtered)
+overlap_mat <- matrix(0, ncol = ncol(bin_mat), nrow = ncol(bin_mat))
+rownames(overlap_mat) <- colnames(log2_filtered)
+colnames(overlap_mat) <- colnames(log2_filtered)
+
+for (i in 1:ncol(bin_mat)) {
+  for (j in 1:ncol(bin_mat)) {
+    intersection <- sum(bin_mat[, i] & bin_mat[, j])
+    # Raw count of shared proteins
+    overlap_mat[i, j] <- intersection
+  }
+}
+
+# Sadece kaydet
+pheatmap(overlap_mat,
+  annotation_col = anno_col,
+  annotation_colors = list(Group = npg_colors),
+  main = "Overlap Heatmap (Shared Proteins Count)",
+  display_numbers = FALSE,
+  color = colorRampPalette(c("white", "forestgreen"))(100),
+  filename = file.path(out_dir, "QC_Overlap_Heatmap.png"),
+  width = 8, height = 8
+)
+
+# RMarkdown içerisinde ekrana bas
+pheatmap(overlap_mat,
+  annotation_col = anno_col,
+  annotation_colors = list(Group = npg_colors),
+  main = "Overlap Heatmap (Shared Proteins Count)",
+  display_numbers = FALSE,
+  color = colorRampPalette(c("white", "forestgreen"))(100)
+)
+
+knitr::include_graphics(file.path(out_dir, "QC_Overlap_Heatmap.png"))
+```
+
+---
+
+### 3.7. Mean-Variance Trends
+```{r qc_variance_trend, echo=FALSE, warning=FALSE, message=FALSE}
+int_cols <- paste0("Intensity ", sample_names)
+if (all(int_cols %in% colnames(df))) {
+  mat_int <- as.matrix(df[keep_rows, int_cols])
+} else {
+  mat_int <- as.matrix(df[keep_rows, lfq_cols])
+}
+
+lfq_specific_cols <- paste0("LFQ intensity ", sample_names)
+if (all(lfq_specific_cols %in% colnames(df))) {
+  mat_lfq <- as.matrix(df[keep_rows, lfq_specific_cols])
+} else {
+  mat_lfq <- as.matrix(df[keep_rows, lfq_cols])
+}
+
+mat_int[mat_int == 0] <- NA
+mat_lfq[mat_lfq == 0] <- NA
+
+mat_log2_lfq <- log2(mat_lfq)
+mat_norm <- log2_filtered_pre_imputation
+mat_imputed <- log2_filtered
+
+calc_mv <- function(mat, name, is_log) {
+  valid_rows <- rowSums(!is.na(mat)) > 1
+  mat_clean <- mat[valid_rows, , drop=FALSE]
+  
+  row_mean <- apply(mat_clean, 1, mean, na.rm = TRUE)
+  row_sd <- apply(mat_clean, 1, sd, na.rm = TRUE)
+  
+  # voom/vooma stili x ekseni (ortalama log2 intensity veya log2(ortalama raw intensity))
+  x_val <- if(is_log) row_mean else log2(row_mean + 1)
+  
+  data.frame(
+    Mean = x_val,
+    Sqrt_SD = sqrt(row_sd),
+    Type = name
+  )
+}
+
+df_mv_int <- calc_mv(mat_int, "1. Raw Intensity", is_log = FALSE)
+df_mv_lfq <- calc_mv(mat_lfq, "2. LFQ Intensity", is_log = FALSE)
+df_mv_log2 <- calc_mv(mat_log2_lfq, "3. Log2(LFQ)", is_log = TRUE)
+df_mv_norm <- calc_mv(mat_norm, paste0("4. Normalized (", normalization_method, ")"), is_log = TRUE)
+df_mv_imp <- calc_mv(mat_imputed, paste0("5. Imputed (", imputation_method, ")"), is_log = TRUE)
+
+df_mv_all <- rbind(df_mv_int, df_mv_lfq, df_mv_log2, df_mv_norm, df_mv_imp)
+
+p_var <- ggplot(df_mv_all, aes(x = Mean, y = Sqrt_SD)) +
+  geom_point(alpha = 0.3, size = 0.8, color = "black") +
+  geom_smooth(method = "loess", color = "red", se = FALSE, span = 0.5) +
+  facet_wrap(~ Type, scales = "free") +
+  theme_minimal() +
+  labs(title = "Mean-Variance Trends (Vooma Style)", 
+       x = "Average log2 Expression", 
+       y = "Sqrt( standard deviation )")
+
+print(p_var)
+ggsave(file.path(out_dir, "QC_Mean_Variance_Trends.png"), plot = p_var, width = 10, height = 8, dpi = 300)
+```
+
+---
+
+## Part 4: Differential Expression Analysis
+
+You can analyze all comparisons defined in your `contrast.txt` file automatically.
+
+### 4.1. Differential Expression Analysis & Tables
+```{r dea_analysis, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+# --- Heatmap Column Ordering ---
+if (length(group_order) > 0 && all(design$groups %in% group_order)) {
+  design$groups <- factor(design$groups, levels = group_order)
+} else {
+  design$groups <- factor(design$groups)
+}
+
+order_idx <- order(design$groups)
+design_ordered <- design[order_idx, ]
+log2_filtered_ordered <- log2_filtered[, order_idx]
+
+groups <- factor(design$groups)
+design_matrix <- model.matrix(~ 0 + groups)
+colnames(design_matrix) <- levels(groups)
+
+fit <- lmFit(log2_filtered, design_matrix)
+
+all_results <- data.frame()
+
+for (comp_idx in 1:nrow(contrast)) {
+  g1 <- contrast$group1[comp_idx]
+  g2 <- contrast$group2[comp_idx]
+  comp_name <- paste0(g1, "_vs_", g2)
+  comp_str <- paste0(g1, "-", g2)
+  cat("\n\n### Comparison: ", comp_name, "\n\n")
+
+  contrast_matrix <- makeContrasts(contrasts = comp_str, levels = design_matrix)
+  fit2 <- contrasts.fit(fit, contrast_matrix)
+  fit2 <- eBayes(fit2)
+
+  if (dea_method == "deqms") {
+    counts <- sapply(df_filtered[[actual_count_col]], function(x) {
+      vals <- suppressWarnings(as.numeric(unlist(strsplit(as.character(x), ";"))))
+      if (all(is.na(vals))) return(1) else return(max(vals, na.rm = TRUE))
+    })
+    fit2$count <- counts
+    
+    unique_counts <- length(unique(counts))
+    if (unique_counts < 2 || length(counts) < 20) {
+      fit2 <- eBayes(fit2)
+      results <- topTable(fit2, sort.by = "none", n = Inf)
+    } else {
+      fit3 <- tryCatch({ spectraCounteBayes(fit2) }, error = function(e) { NULL })
+      if (is.null(fit3)) {
+        fit2 <- eBayes(fit2)
+        results <- topTable(fit2, sort.by = "none", n = Inf)
+      } else {
+        res_deqms <- outputResult(fit3, coef_col = 1)
+        res_deqms <- res_deqms[rownames(fit2$coefficients), ]
+        results <- res_deqms
+        results$P.Value <- res_deqms$sca.P.Value
+        results$adj.P.Val <- res_deqms$sca.adj.pval
+      }
+    }
+    if ("sca.t" %in% colnames(results)) results$t <- results$sca.t
+  } else {
+    fit2 <- eBayes(fit2)
+    results <- topTable(fit2, sort.by = "none", n = Inf)
+  }
+
+  res_df <- cbind(df_filtered[, c("Protein IDs", "Gene names")], results)
+  
+  # Ensure clean Gene column with fallback to Protein ID if Gene is missing
+  gene_clean <- res_df$`Gene names`
+  gene_clean[is.na(gene_clean) | gene_clean == ""] <- res_df$`Protein IDs`[is.na(gene_clean) | gene_clean == ""]
+  res_df$Gene <- gene_clean
+
+  res_df <- cbind(res_df, log2_filtered)
+
+  res_df$Significant <- "Not Significant"
+  if (p_val_type == "pvalue") {
+    res_df$Significant[res_df$logFC > logFC_threshold & res_df$P.Value < adj_pval_threshold] <- "Enriched"
+    res_df$Significant[res_df$logFC < -logFC_threshold & res_df$P.Value < adj_pval_threshold] <- "Reduced"
+  } else {
+    res_df$Significant[res_df$logFC > logFC_threshold & res_df$adj.P.Val < adj_pval_threshold] <- "Enriched"
+    res_df$Significant[res_df$logFC < -logFC_threshold & res_df$adj.P.Val < adj_pval_threshold] <- "Reduced"
+  }
+
+  res_df$Comparison <- comp_name
+  all_results <- rbind(all_results, res_df)
+  
+  dea_filtered <- res_df %>% filter(Significant != "Not Significant") %>% arrange(desc(logFC))
+
+  write.csv(dea_filtered, file.path(out_dir, paste0("absolute_proteins_", comp_name, ".csv")), row.names = FALSE)
+  write.csv(res_df, file.path(out_dir, paste0("all_proteins_", comp_name, ".csv")), row.names = FALSE)
+
+  enriched <- dea_filtered %>% filter(Significant == "Enriched") %>% arrange(desc(logFC))
+  reduced <- dea_filtered %>% filter(Significant == "Reduced") %>% arrange(logFC)
+
+  top_enriched <- head(enriched, 10)
+  top_reduced <- head(reduced, 10)
+
+  cat("\n#### Top 10 Enriched Proteins\n\n")
+  print(kable(top_enriched[, c("Protein IDs", "Gene names", "logFC", "P.Value", "adj.P.Val")], format = "markdown"))
+
+  cat("\n\n#### Top 10 Reduced Proteins\n\n")
+  print(kable(top_reduced[, c("Protein IDs", "Gene names", "logFC", "P.Value", "adj.P.Val")], format = "markdown"))
+  cat("\n\n")
+}
+```
+
+### 4.2. Volcano Plot
+```{r volcano_plot, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+for (comp_name in unique(all_results$Comparison)) {
+  res_df <- all_results %>% filter(Comparison == comp_name)
+  enriched <- res_df %>% filter(Significant == "Enriched") %>% arrange(desc(logFC))
+  reduced <- res_df %>% filter(Significant == "Reduced") %>% arrange(logFC)
+  top_genes <- rbind(head(enriched, 10), head(reduced, 10))
+  
+  parts <- unlist(strsplit(comp_name, "_vs_"))
+  g1 <- parts[1]; g2 <- parts[2]
+
+  if (p_val_type == "pvalue") {
+    p_volcano <- ggplot(res_df, aes(x = logFC, y = -log10(P.Value), color = Significant)) +
+      geom_point(alpha = 0.8) +
+      scale_color_manual(values = c("Enriched" = "red", "Reduced" = "blue", "Not Significant" = "gray")) +
+      theme_minimal() +
+      geom_vline(xintercept = c(-logFC_threshold, logFC_threshold), linetype = "dashed", color = "black") +
+      geom_hline(yintercept = -log10(adj_pval_threshold), linetype = "dashed", color = "black") +
+      geom_text_repel(data = top_genes, aes(label = `Gene names`), size = 3, max.overlaps = 20) +
+      labs(title = paste("Volcano Plot -", comp_name), x = paste("Log2 Fold Change (", g1, "vs", g2, ")"), y = "-Log10(P-value)")
+  } else {
+    p_volcano <- ggplot(res_df, aes(x = logFC, y = -log10(adj.P.Val), color = Significant)) +
+      geom_point(alpha = 0.8) +
+      scale_color_manual(values = c("Enriched" = "red", "Reduced" = "blue", "Not Significant" = "gray")) +
+      theme_minimal() +
+      geom_vline(xintercept = c(-logFC_threshold, logFC_threshold), linetype = "dashed", color = "black") +
+      geom_hline(yintercept = -log10(adj_pval_threshold), linetype = "dashed", color = "black") +
+      geom_text_repel(data = top_genes, aes(label = `Gene names`), size = 3, max.overlaps = 20) +
+      labs(title = paste(comp_name), x = paste("Log2 Fold Change (", g1, "vs", g2, ")"), y = "-Log10(Adjusted P-value)") +
+      theme(plot.title = element_text(face = "bold", size = 18, hjust = 0.5), legend.position = "none")
+  }
+
+  cat("\n#### Volcano Plot - ", comp_name, "\n\n")
+  print(p_volcano)
+  ggsave(file.path(out_dir, paste0("DEA_Volcano_Plot_", comp_name, ".png")), plot = p_volcano, width = 8, height = 6, dpi = 300)
+  cat("\n\n")
+}
+```
+
+### 4.3. All Heatmap (Including NAs)
+```{r all_heatmap_with_na, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+for (comp_name in unique(all_results$Comparison)) {
+  res_df <- all_results %>% filter(Comparison == comp_name)
+  sig_proteins <- res_df %>% filter(Significant != "Not Significant")
+  
+  if (nrow(sig_proteins) > 2) {
+    heatmap_mat <- log2_filtered_ordered[res_df$Significant != "Not Significant", ]
+    row_labels <- sig_proteins$`Gene names`
+    row_labels[row_labels == "" | is.na(row_labels)] <- sig_proteins$`Protein IDs`[row_labels == "" | is.na(row_labels)]
+    rownames(heatmap_mat) <- make.unique(row_labels)
+
+    anno_col_ordered <- data.frame(Group = design_ordered$groups)
+    rownames(anno_col_ordered) <- colnames(log2_filtered_ordered)
+    
+    cols_to_keep <- !anno_col_ordered$Group %in% heatmap_exclude_groups
+    heatmap_mat <- heatmap_mat[, cols_to_keep, drop = FALSE]
+    anno_col_ordered <- anno_col_ordered[cols_to_keep, , drop = FALSE]
+
+    # Padding groups with spaces to force pheatmap to add extra right margin for the legend
+    anno_col_ordered$Group <- paste0(anno_col_ordered$Group, "      ")
+    padded_npg_colors <- npg_colors
+    names(padded_npg_colors) <- paste0(names(npg_colors), "      ")
+
+    # Custom robust scaling for 'With NA' heatmap to preserve NAs
+    scaled_mat_with_na <- t(apply(heatmap_mat, 1, function(y) {
+      sdev <- sd(y, na.rm = TRUE)
+      if (is.na(sdev) || sdev == 0) {
+        y_scaled <- rep(0, length(y))
+        y_scaled[is.na(y)] <- NA
+        return(y_scaled)
+      }
+      (y - mean(y, na.rm = TRUE)) / sdev
+    }))
+    dimnames(scaled_mat_with_na) <- dimnames(heatmap_mat)
+    
+    # Calculate robust distance avoiding NAs
+    row_cor_with_na <- cor(t(scaled_mat_with_na), use = "pairwise.complete.obs")
+    row_cor_with_na[is.na(row_cor_with_na)] <- 0
+    row_dist_with_na <- as.dist(1 - row_cor_with_na)
+
+    cat("\n#### Heatmap (Including NAs) - ", comp_name, "\n\n")
+    pheatmap(scaled_mat_with_na,
+      scale = "none", annotation_col = anno_col_ordered,
+      annotation_colors = list(Group = padded_npg_colors),
+      cluster_cols = FALSE,
+      cluster_rows = TRUE,
+      clustering_distance_rows = row_dist_with_na,
+      show_rownames = (nrow(scaled_mat_with_na) < 50),
+      na_col = "white",
+      border_color = NA,
+      main = paste("Heatmap (With NAs) -", comp_name),
+      filename = file.path(out_dir, paste0("DEA_Heatmap_WithNA_", comp_name, ".png")), width = 9, height = 9, res = 300
+    )
+    cat(paste0("![Heatmap (With NAs) - ", comp_name, "](", file.path(out_dir, paste0("DEA_Heatmap_WithNA_", comp_name, ".png")), ")\n\n"))
+  } else {
+    cat("\nYeterli anlamli protein bulunamadi, Heatmap cizilemiyor: ", comp_name, "\n\n")
+  }
+}
+```
+
+### 4.4. All Heatmap (Excluding NAs)
+```{r all_heatmap_no_na, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+for (comp_name in unique(all_results$Comparison)) {
+  res_df <- all_results %>% filter(Comparison == comp_name)
+  sig_proteins <- res_df %>% filter(Significant != "Not Significant")
+  
+  if (nrow(sig_proteins) > 2) {
+    heatmap_mat <- log2_filtered_ordered[res_df$Significant != "Not Significant", ]
+    row_labels <- sig_proteins$`Gene names`
+    row_labels[row_labels == "" | is.na(row_labels)] <- sig_proteins$`Protein IDs`[row_labels == "" | is.na(row_labels)]
+    rownames(heatmap_mat) <- make.unique(row_labels)
+
+    anno_col_ordered <- data.frame(Group = design_ordered$groups)
+    rownames(anno_col_ordered) <- colnames(log2_filtered_ordered)
+    
+    cols_to_keep <- !anno_col_ordered$Group %in% heatmap_exclude_groups
+    heatmap_mat <- heatmap_mat[, cols_to_keep, drop = FALSE]
+    anno_col_ordered <- anno_col_ordered[cols_to_keep, , drop = FALSE]
+    
+    # Padding groups with spaces to force pheatmap to add extra right margin for the legend
+    anno_col_ordered$Group <- paste0(anno_col_ordered$Group, "      ")
+    padded_npg_colors <- npg_colors
+    names(padded_npg_colors) <- paste0(names(npg_colors), "      ")
+
+    heatmap_mat_clean <- heatmap_mat[complete.cases(heatmap_mat), ]
+    if (nrow(heatmap_mat_clean) > 2) {
+      cat("\n#### Heatmap (Excluding NAs) - ", comp_name, "\n\n")
+      pheatmap(heatmap_mat_clean,
+        scale = "row", annotation_col = anno_col_ordered,
+        annotation_colors = list(Group = padded_npg_colors),
+        cluster_cols = FALSE,
+        border_color = NA,
+        show_rownames = (nrow(heatmap_mat_clean) < 50),
+        main = paste("Heatmap (No NAs) -", comp_name),
+        filename = file.path(out_dir, paste0("DEA_Heatmap_NoNA_", comp_name, ".png")), width = 9, height = 9, res = 300
+      )
+      cat(paste0("![Heatmap (No NAs) - ", comp_name, "](", file.path(out_dir, paste0("DEA_Heatmap_NoNA_", comp_name, ".png")), ")\n\n"))
+    } else {
+      cat("\nNA'ler cikarildiktan sonra yeterli protein kalmadi: ", comp_name, "\n\n")
+    }
+  }
+}
+```
+
+### 4.5. Top 50 Heatmap (Top 25 Up / 25 Down)
+```{r top50_heatmap, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+for (comp_name in unique(all_results$Comparison)) {
+  res_df <- all_results %>% filter(Comparison == comp_name)
+  enriched <- res_df %>% filter(Significant == "Enriched") %>% arrange(desc(logFC))
+  reduced <- res_df %>% filter(Significant == "Reduced") %>% arrange(logFC)
+  
+  top_enriched_split <- head(enriched, 25)
+  top_reduced_split <- head(reduced, 25)
+  top50_split <- rbind(top_enriched_split, top_reduced_split)
+  
+  if (nrow(top50_split) > 2) {
+    sig_indices_50_split <- which(df_filtered$`Protein IDs` %in% top50_split$`Protein IDs`)
+    heatmap_mat_50_split <- log2_filtered_ordered[sig_indices_50_split, ]
+    
+    row_labels_50_split <- df_filtered$`Gene names`[sig_indices_50_split]
+    row_labels_50_split[row_labels_50_split == "" | is.na(row_labels_50_split)] <- df_filtered$`Protein IDs`[sig_indices_50_split][row_labels_50_split == "" | is.na(row_labels_50_split)]
+    rownames(heatmap_mat_50_split) <- make.unique(row_labels_50_split)
+    
+    anno_col_ordered <- data.frame(Group = design_ordered$groups)
+    rownames(anno_col_ordered) <- colnames(log2_filtered_ordered)
+    cols_to_keep <- !anno_col_ordered$Group %in% heatmap_exclude_groups
+    heatmap_mat_50_split <- heatmap_mat_50_split[, cols_to_keep, drop = FALSE]
+    
+    anno_col_ordered <- anno_col_ordered[cols_to_keep, , drop = FALSE]
+    
+    # Padding groups with spaces to force pheatmap to add extra right margin for the legend
+    anno_col_ordered$Group <- paste0(anno_col_ordered$Group, "      ")
+    padded_npg_colors <- npg_colors
+    names(padded_npg_colors) <- paste0(names(npg_colors), "      ")
+
+    # Scale row-wise robustly
+    scaled_mat_50_split <- t(apply(heatmap_mat_50_split, 1, function(y) {
+      sdev <- sd(y, na.rm = TRUE)
+      if (is.na(sdev) || sdev == 0) y - mean(y, na.rm = TRUE) else (y - mean(y, na.rm = TRUE)) / sdev
+    }))
+    colnames(scaled_mat_50_split) <- colnames(heatmap_mat_50_split)
+    rownames(scaled_mat_50_split) <- rownames(heatmap_mat_50_split)
+    
+    col_cor_50_split <- cor(scaled_mat_50_split, use = "pairwise.complete.obs")
+    col_cor_50_split[is.na(col_cor_50_split)] <- 0
+    col_dist_50_split <- as.dist(1 - col_cor_50_split)
+    
+    row_cor_50_split <- cor(t(scaled_mat_50_split), use = "pairwise.complete.obs")
+    row_cor_50_split[is.na(row_cor_50_split)] <- 0
+    row_dist_50_split <- as.dist(1 - row_cor_50_split)
+    
+    cat("\n#### Top 50 Heatmap - ", comp_name, "\n\n")
+    pheatmap(scaled_mat_50_split,
+      scale = "none", annotation_col = anno_col_ordered,
+      annotation_colors = list(Group = padded_npg_colors),
+      cluster_cols = FALSE,
+      cluster_rows = TRUE,
+      clustering_distance_cols = col_dist_50_split,
+      clustering_distance_rows = row_dist_50_split,
+      show_rownames = TRUE,
+      na_col = "white",
+      border_color = NA,
+      filename = file.path(out_dir, paste0("DEA_Heatmap_Top50_", comp_name, ".png")), width = 9, height = 9, res = 300
+    )
+    
+    cat(paste0("![Top 50 Heatmap - ", comp_name, "](", file.path(out_dir, paste0("DEA_Heatmap_Top50_", comp_name, ".png")), ")\n\n"))
+  } else {
+      cat("\nYeterli anlamli protein bulunamadi, Heatmap cizilemiyor: ", comp_name, "\n\n")
+  }
+}
+```
+
+
+```{r save_results, echo=FALSE, warning=FALSE, message=FALSE}
+write.csv(all_results, file.path(out_dir, "amica_replication_full_results.csv"), row.names = FALSE)
+cat("Analiz basariyla tamamlandi, tum dosyalar kaydedildi.\n")
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

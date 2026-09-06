@@ -1,0 +1,1133 @@
+---
+title: "Ultimate Functional & Pathway Analysis"
+author: "Automated Bioinformatics Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "C:/Users/serife-ayaz/Desktop/DKAAN_Snigra") })
+---
+
+# Ultimate Functional & Pathway Analysis
+
+This pipeline is designed for multiple comparisons automatically running sequentially. 
+
+## Part 1: Configuration & Data Import
+
+```{r setup, message=FALSE, warning=FALSE, results='asis'}
+# Required Packages
+library(dplyr)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ReactomePA)
+library(STRINGdb)
+library(igraph)
+library(knitr)
+library(kableExtra)
+library(stringr)
+library(pheatmap)
+
+# --- PIPELINE CONFIGURATION ---
+data_dir <- "C:/Users/serife-ayaz/Desktop/DKAAN_Snigra"
+out_dir <- "C:/Users/serife-ayaz/Desktop/DKAAN_Snigra"
+
+contrast_file <- file.path(data_dir, "contrast.txt")
+
+if (file.exists(contrast_file)) {
+  contrast_df <- read.delim(contrast_file, stringsAsFactors = FALSE)
+  comp_names <- paste0(contrast_df[,1], "_vs_", contrast_df[,2])
+} else {
+  comp_names <- c("AD_vs_AY")
+}
+
+# ---------------------------------------------------------
+# 1. GSEA & RANKING CONFIGURATION
+# ---------------------------------------------------------
+# Options:
+# "stat"      : P-değeri ve logFC birleşimi pi-skoru (-log10(P.Value) * sign(logFC)) [Önerilen Proteomik Standardı]
+# "t"         : Limma / DEqMS t-istatistiği
+# "logFC"     : Saf Fold Change (Geleneksel yöntem)
+# "penalized" : Tespit Olasılığı (Detection Probability) ile ağırlıklandırılmış model
+RANKING_METRIC <- "stat"
+
+# ---------------------------------------------------------
+# 2. BACKGROUND UNIVERSE CONFIGURATION (Proteomics Specific)
+# ---------------------------------------------------------
+# TRUE: ORA analizlerinde (enrichGO, enrichKEGG, enrichPathway) arka plan olarak
+#       bütün insan genomu (20.000 gen) yerine sadece kütle spektrometresinde 
+#       tespit edilen proteinler (all_proteins_*.csv) kullanılır. 
+#       Proteomik için bilimsel olarak en doğru yöntemdir!
+USE_CUSTOM_UNIVERSE <- TRUE
+
+GSEA_FDR_THRESHOLD <- 0.05
+gsea_pval_cutoff <- GSEA_FDR_THRESHOLD
+GSEA_MIN_SIZE <- 15
+GSEA_MAX_SIZE <- 350
+simplify_cutoff <- 0.70
+
+# Column Name mappings
+col_gene <- "Gene" 
+col_logfc <- "logFC"
+col_pval <- "adj.P.Val" # "P.Value" or "adj.P.Val"
+
+# ORA (Over-Representation) & PPI Thresholds
+logfc_threshold <- 0.54
+pval_threshold <- 0.05
+
+# Excluded Terms
+exclude_terms <- c("Parkinson", "Coronavirus", "disease", "COVID-19", "Alzheimer", "Huntington", "bacterial", "African", "trypanosomiasis", "lupus", "malaria", "Tuberculosis", "Chagas", "Staphylococcus", "Leishmaniasis")
+
+# PPI Network
+max_ppi_nodes <- 25      
+
+custom_gsea_bp <- "ALL"
+custom_gsea_kegg <- "ALL"
+exclude_gsea_heatmaps <- c("Parkinson disease")
+# ------------------------------
+
+de_data_file <- file.path(data_dir, "amica_replication_full_results.csv")
+if (file.exists(de_data_file)) {
+  de_data <- read.csv(de_data_file)
+  potential_cols <- colnames(de_data)[grepl("[A-Za-z]+.*[0-9]+", colnames(de_data))]
+  sample_cols <- setdiff(potential_cols, c("logFC", "P.Value", "adj.P.Val", "t", "B", "count", "sca.t", "sca.P.Value", "sca.adj.pval", "Protein.IDs", "Protein IDs", "Gene.names", "Gene names", "gene", "Comparison", "Significant", "AveExpr", "RankScore"))
+}
+
+data_list <- list()
+
+for (comp_name in comp_names) {
+  abs_file <- file.path(data_dir, paste0("absolute_proteins_", comp_name, ".csv"))
+  all_file <- file.path(data_dir, paste0("all_proteins_", comp_name, ".csv"))
+  
+  if (!file.exists(abs_file) | !file.exists(all_file)) {
+    cat(paste("HATA: Dosyalar bulunamadi, atlaniyor: ", comp_name, "\n"))
+    next
+  }
+  
+  df <- read.csv(abs_file, stringsAsFactors = FALSE, check.names = FALSE)
+  df_full <- read.csv(all_file, stringsAsFactors = FALSE, check.names = FALSE)
+  
+  actual_col_gene <- colnames(df)[grepl("^Gene$|^Gene\\.names$|^Gene names$", colnames(df), ignore.case = TRUE)][1]
+  if (is.na(actual_col_gene)) actual_col_gene <- colnames(df)[grepl("Gene", colnames(df), ignore.case = TRUE)][1]
+  
+  actual_col_logfc <- colnames(df)[grepl("^logFC$|^log2FoldChange$", colnames(df), ignore.case = TRUE)][1]
+  if (is.na(actual_col_logfc)) actual_col_logfc <- colnames(df)[grepl("logFC", colnames(df), ignore.case = TRUE)][1]
+  
+  actual_col_pval <- colnames(df)[grepl(paste0("^", col_pval, "$"), colnames(df), ignore.case = TRUE)][1]
+  if (is.na(actual_col_pval)) {
+    actual_col_pval <- colnames(df)[grepl("P\\.Value|pvalue|P.val", colnames(df), ignore.case = TRUE)][1]
+  }
+  
+  df[[actual_col_gene]] <- sapply(strsplit(as.character(df[[actual_col_gene]]), ";"), `[`, 1)
+  df_full[[actual_col_gene]] <- sapply(strsplit(as.character(df_full[[actual_col_gene]]), ";"), `[`, 1)
+  
+  # Fallback to Protein IDs if Gene name is missing
+  pid_col <- colnames(df_full)[grepl("Protein.*ID", colnames(df_full), ignore.case = TRUE)][1]
+  if (!is.na(pid_col)) {
+    df_full[[pid_col]] <- sapply(strsplit(as.character(df_full[[pid_col]]), ";"), `[`, 1)
+    df_full[[actual_col_gene]][is.na(df_full[[actual_col_gene]]) | df_full[[actual_col_gene]] == ""] <- df_full[[pid_col]][is.na(df_full[[actual_col_gene]]) | df_full[[actual_col_gene]] == ""]
+  }
+  
+  pid_col_df <- colnames(df)[grepl("Protein.*ID", colnames(df), ignore.case = TRUE)][1]
+  if (!is.na(pid_col_df)) {
+    df[[pid_col_df]] <- sapply(strsplit(as.character(df[[pid_col_df]]), ";"), `[`, 1)
+    df[[actual_col_gene]][is.na(df[[actual_col_gene]]) | df[[actual_col_gene]] == ""] <- df[[pid_col_df]][is.na(df[[actual_col_gene]]) | df[[actual_col_gene]] == ""]
+  }
+  
+  df_sig <- df %>% filter(!!sym(actual_col_pval) < pval_threshold)
+  
+  df_enriched <- df_sig %>% filter(!!sym(actual_col_logfc) > logfc_threshold) %>% arrange(desc(!!sym(actual_col_logfc)))
+  df_reduced <- df_sig %>% filter(!!sym(actual_col_logfc) < -logfc_threshold) %>% arrange(!!sym(actual_col_logfc))
+  
+  write.csv(df_enriched, file.path(out_dir, paste0("Ultimate_Enriched_Proteins_", comp_name, ".csv")), row.names = FALSE)
+  write.csv(df_reduced, file.path(out_dir, paste0("Ultimate_Reduced_Proteins_", comp_name, ".csv")), row.names = FALSE)
+  
+  fc_enriched <- setNames(df_enriched[[actual_col_logfc]], df_enriched[[actual_col_gene]])
+  fc_reduced <- setNames(df_reduced[[actual_col_logfc]], df_reduced[[actual_col_gene]])
+  
+  # ---------------------------------------------------------
+  # RANKING CALCULATION FOR GSEA
+  # ---------------------------------------------------------
+  df_full <- df_full[!is.na(df_full[[actual_col_gene]]) & df_full[[actual_col_gene]] != "", ]
+  
+  if (RANKING_METRIC == "logFC" || (RANKING_METRIC == "t" && !"t" %in% colnames(df_full))) {
+    df_full$RankScore <- as.numeric(df_full[[actual_col_logfc]])
+  } else if (RANKING_METRIC == "t" && "t" %in% colnames(df_full)) {
+    df_full$RankScore <- as.numeric(df_full$t)
+  } else if (RANKING_METRIC == "stat") {
+    pval_vec <- as.numeric(df_full[[actual_col_pval]])
+    lfc_vec <- as.numeric(df_full[[actual_col_logfc]])
+    pval_vec[is.na(pval_vec) | pval_vec == 0] <- 1e-300
+    df_full$RankScore <- -log10(pval_vec) * sign(lfc_vec)
+  } else if (RANKING_METRIC == "penalized") {
+    score_base <- if("t" %in% colnames(df_full)) as.numeric(df_full$t) else as.numeric(df_full[[actual_col_logfc]])
+    if ("Detection_Prob" %in% colnames(df_full)) {
+      df_full$RankScore <- score_base * df_full$Detection_Prob
+    } else {
+      df_full$RankScore <- score_base
+    }
+  } else {
+    df_full$RankScore <- as.numeric(df_full[[actual_col_logfc]])
+  }
+  
+  # Deduplicate genes by keeping the one with highest absolute RankScore
+  df_full <- df_full[order(abs(df_full$RankScore), decreasing = TRUE), ]
+  df_full <- df_full[!duplicated(df_full[[actual_col_gene]]), ]
+  
+  gene_list <- df_full$RankScore
+  names(gene_list) <- df_full[[actual_col_gene]]
+  gene_list <- sort(gene_list, decreasing = TRUE)
+  gene_list <- gene_list[!is.na(gene_list)]
+  
+  genes_enr <- df_enriched[[actual_col_gene]][!is.na(df_enriched[[actual_col_gene]]) & df_enriched[[actual_col_gene]] != ""]
+  genes_red <- df_reduced[[actual_col_gene]][!is.na(df_reduced[[actual_col_gene]]) & df_reduced[[actual_col_gene]] != ""]
+  
+  universe_symbols <- names(gene_list)
+  universe_entrez <- tryCatch({
+    res_u <- bitr(universe_symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+    unique(res_u$ENTREZID[!is.na(res_u$ENTREZID)])
+  }, error = function(e) character(0))
+  
+  data_list[[comp_name]] <- list(
+    df_enriched = df_enriched,
+    df_reduced = df_reduced,
+    fc_enriched = fc_enriched,
+    fc_reduced = fc_reduced,
+    gene_list = gene_list,
+    genes_enr = genes_enr,
+    genes_red = genes_red,
+    universe_symbols = universe_symbols,
+    universe_entrez = universe_entrez,
+    actual_col_gene = actual_col_gene
+  )
+  
+  cat("\n**Data Summary for", comp_name, ":**\n")
+  cat("- Total significant proteins found: ", nrow(df_sig), "\n")
+  cat("- Enriched (Up-regulated) proteins: ", nrow(df_enriched), "\n")
+  cat("- Reduced (Down-regulated) proteins: ", nrow(df_reduced), "\n")
+  cat("- Total proteins for GSEA (Ranking metric: ", RANKING_METRIC, "): ", length(gene_list), "\n")
+  if (exists("sample_cols")) {
+    cat("- Heatmap sample columns detected: ", paste(sample_cols, collapse=", "), "\n")
+  }
+  cat("\n**Enriched Proteins:**\n", paste(genes_enr, collapse=", "), "\n\n")
+  cat("**Reduced Proteins:**\n", paste(genes_red, collapse=", "), "\n\n")
+}
+
+# --- INITIALIZE RESULTS LIST ---
+results_list <- list()
+for (comp_name in names(data_list)) {
+  results_list[[comp_name]] <- list()
+}
+```
+
+---
+
+## Part 2: Comprehensive Gene Ontology (GO) Analysis
+
+### 2.1 Biological Process (BP)
+
+#### BP Enriched
+
+```{r go_bp_enr, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### BP Enriched (", comp_name, ")\n\n"))
+  genes_enr <- data_list[[comp_name]]$genes_enr
+  fc_enriched <- data_list[[comp_name]]$fc_enriched
+  
+  print(paste("Number of proteins for BP Enriched:", length(genes_enr)))
+  if (length(genes_enr) > 0) {
+    universe_symbols <- data_list[[comp_name]]$universe_symbols
+    ego_bp_enr <- enrichGO(gene = genes_enr,
+                           universe = if (USE_CUSTOM_UNIVERSE) universe_symbols else NULL,
+                           OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                           pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+    if (!is.null(ego_bp_enr) && nrow(as.data.frame(ego_bp_enr)) > 0) {
+      ego_bp_enr <- clusterProfiler::simplify(ego_bp_enr, cutoff = simplify_cutoff, by = "p.adjust", select_fun = min)
+      
+      ego_bp_enr@result <- ego_bp_enr@result[!grepl("adaptive immune response based on somatic", ego_bp_enr@result$Description, ignore.case = TRUE), ]
+      
+      ego_bp_enr@result$Description <- stringr::str_wrap(ego_bp_enr@result$Description, width = 75)
+      write.csv(as.data.frame(ego_bp_enr), file.path(out_dir, paste0("Ultimate_GO_BP_Enriched_", comp_name, ".csv")), row.names = FALSE)
+      
+      print(dotplot(ego_bp_enr, showCategory = 15, label_format = 75) + ggtitle(paste("GO BP Enriched -", comp_name)) + theme_minimal() + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_BP_Dotplot_Enriched_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+      print(cnetplot(ego_bp_enr, foldChange = fc_enriched, showCategory = 5) + ggtitle(paste("GO Network (CNET) BP Enriched -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_BP_CNET_Enriched_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+      
+      results_list[[comp_name]]$ego_bp_enr <- ego_bp_enr
+    } else { print("No significant BP terms for Enriched proteins.") }
+  } else { print("Not enough genes for BP Enriched.") }
+  cat("\n\n")
+}
+```
+
+#### BP Reduced
+
+```{r go_bp_red, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### BP Reduced (", comp_name, ")\n\n"))
+  genes_red <- data_list[[comp_name]]$genes_red
+  fc_reduced <- data_list[[comp_name]]$fc_reduced
+
+  print(paste("Number of proteins for BP Reduced:", length(genes_red)))
+  if (length(genes_red) > 0) {
+    universe_symbols <- data_list[[comp_name]]$universe_symbols
+    ego_bp_red <- enrichGO(gene = genes_red,
+                           universe = if (USE_CUSTOM_UNIVERSE) universe_symbols else NULL,
+                           OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                           pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+    if (!is.null(ego_bp_red) && nrow(as.data.frame(ego_bp_red)) > 0) {
+      ego_bp_red <- clusterProfiler::simplify(ego_bp_red, cutoff = simplify_cutoff, by = "p.adjust", select_fun = min)
+      ego_bp_red@result$Description <- stringr::str_wrap(ego_bp_red@result$Description, width = 75)
+      write.csv(as.data.frame(ego_bp_red), file.path(out_dir, paste0("Ultimate_GO_BP_Reduced_", comp_name, ".csv")), row.names = FALSE)
+      
+      print(dotplot(ego_bp_red, showCategory = 15, label_format = 75) + ggtitle(paste("GO BP Reduced -", comp_name)) + theme_minimal() + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_BP_Dotplot_Reduced_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+      print(cnetplot(ego_bp_red, foldChange = fc_reduced, showCategory = 5) + ggtitle(paste("GO Network (CNET) BP Reduced -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_BP_CNET_Reduced_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+      
+      results_list[[comp_name]]$ego_bp_red <- ego_bp_red
+    } else { print("No significant BP terms for Reduced proteins.") }
+  } else { print("Not enough genes for BP Reduced.") }
+  cat("\n\n")
+}
+```
+
+### 2.2 Cellular Component (CC)
+
+#### CC Enriched
+
+```{r go_cc_enr, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### CC Enriched (", comp_name, ")\n\n"))
+  genes_enr <- data_list[[comp_name]]$genes_enr
+  fc_enriched <- data_list[[comp_name]]$fc_enriched
+
+  print(paste("Number of proteins for CC Enriched:", length(genes_enr)))
+  if (length(genes_enr) > 0) {
+    universe_symbols <- data_list[[comp_name]]$universe_symbols
+    ego_cc_enr <- enrichGO(gene = genes_enr,
+                           universe = if (USE_CUSTOM_UNIVERSE) universe_symbols else NULL,
+                           OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "CC",
+                           pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+    if (!is.null(ego_cc_enr) && nrow(as.data.frame(ego_cc_enr)) > 0) {
+      ego_cc_enr <- clusterProfiler::simplify(ego_cc_enr, cutoff = simplify_cutoff, by = "p.adjust", select_fun = min)
+      ego_cc_enr@result$Description <- stringr::str_wrap(ego_cc_enr@result$Description, width = 75)
+      print(dotplot(ego_cc_enr, showCategory = 15, label_format = 75) + ggtitle(paste("GO CC Enriched -", comp_name)) + theme_minimal() + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_CC_Dotplot_Enriched_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+      print(cnetplot(ego_cc_enr, foldChange = fc_enriched, showCategory = 5) + ggtitle(paste("GO CNET CC Enriched -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_CC_CNET_Enriched_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+      results_list[[comp_name]]$ego_cc_enr <- ego_cc_enr
+    } else { print("No significant CC terms for Enriched proteins.") }
+  } else { print("Not enough genes for CC Enriched.") }
+  cat("\n\n")
+}
+```
+
+#### CC Reduced
+
+```{r go_cc_red, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### CC Reduced (", comp_name, ")\n\n"))
+  genes_red <- data_list[[comp_name]]$genes_red
+  fc_reduced <- data_list[[comp_name]]$fc_reduced
+
+  print(paste("Number of proteins for CC Reduced:", length(genes_red)))
+  if (length(genes_red) > 0) {
+    universe_symbols <- data_list[[comp_name]]$universe_symbols
+    ego_cc_red <- enrichGO(gene = genes_red,
+                           universe = if (USE_CUSTOM_UNIVERSE) universe_symbols else NULL,
+                           OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "CC",
+                           pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+    if (!is.null(ego_cc_red) && nrow(as.data.frame(ego_cc_red)) > 0) {
+      ego_cc_red <- clusterProfiler::simplify(ego_cc_red, cutoff = simplify_cutoff, by = "p.adjust", select_fun = min)
+      ego_cc_red@result$Description <- stringr::str_wrap(ego_cc_red@result$Description, width = 75)
+      print(dotplot(ego_cc_red, showCategory = 15, label_format = 75) + ggtitle(paste("GO CC Reduced -", comp_name)) + theme_minimal() + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_CC_Dotplot_Reduced_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+      print(cnetplot(ego_cc_red, foldChange = fc_reduced, showCategory = 5) + ggtitle(paste("GO CNET CC Reduced -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_CC_CNET_Reduced_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+      results_list[[comp_name]]$ego_cc_red <- ego_cc_red
+    } else { print("No significant CC terms for Reduced proteins.") }
+  } else { print("Not enough genes for CC Reduced.") }
+  cat("\n\n")
+}
+```
+
+### 2.3 Molecular Function (MF)
+
+#### MF Enriched
+
+```{r go_mf_enr, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### MF Enriched (", comp_name, ")\n\n"))
+  genes_enr <- data_list[[comp_name]]$genes_enr
+  fc_enriched <- data_list[[comp_name]]$fc_enriched
+
+  print(paste("Number of proteins for MF Enriched:", length(genes_enr)))
+  if (length(genes_enr) > 0) {
+    universe_symbols <- data_list[[comp_name]]$universe_symbols
+    ego_mf_enr <- enrichGO(gene = genes_enr,
+                           universe = if (USE_CUSTOM_UNIVERSE) universe_symbols else NULL,
+                           OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "MF",
+                           pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+    if (!is.null(ego_mf_enr) && nrow(as.data.frame(ego_mf_enr)) > 0) {
+      ego_mf_enr <- clusterProfiler::simplify(ego_mf_enr, cutoff = simplify_cutoff, by = "p.adjust", select_fun = min)
+      ego_mf_enr@result$Description <- stringr::str_wrap(ego_mf_enr@result$Description, width = 75)
+      print(dotplot(ego_mf_enr, showCategory = 15, label_format = 75) + ggtitle(paste("GO MF Enriched -", comp_name)) + theme_minimal() + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_MF_Dotplot_Enriched_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+      print(cnetplot(ego_mf_enr, foldChange = fc_enriched, showCategory = 5) + ggtitle(paste("GO CNET MF Enriched -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_MF_CNET_Enriched_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+      results_list[[comp_name]]$ego_mf_enr <- ego_mf_enr
+    } else { print("No significant MF terms for Enriched proteins.") }
+  } else { print("Not enough genes for MF Enriched.") }
+  cat("\n\n")
+}
+```
+
+#### MF Reduced
+
+```{r go_mf_red, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### MF Reduced (", comp_name, ")\n\n"))
+  genes_red <- data_list[[comp_name]]$genes_red
+  fc_reduced <- data_list[[comp_name]]$fc_reduced
+
+  print(paste("Number of proteins for MF Reduced:", length(genes_red)))
+  if (length(genes_red) > 0) {
+    universe_symbols <- data_list[[comp_name]]$universe_symbols
+    ego_mf_red <- enrichGO(gene = genes_red,
+                           universe = if (USE_CUSTOM_UNIVERSE) universe_symbols else NULL,
+                           OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "MF",
+                           pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+    if (!is.null(ego_mf_red) && nrow(as.data.frame(ego_mf_red)) > 0) {
+      ego_mf_red <- clusterProfiler::simplify(ego_mf_red, cutoff = simplify_cutoff, by = "p.adjust", select_fun = min)
+      ego_mf_red@result$Description <- stringr::str_wrap(ego_mf_red@result$Description, width = 75)
+      print(dotplot(ego_mf_red, showCategory = 15, label_format = 75) + ggtitle(paste("GO MF Reduced -", comp_name)) + theme_minimal() + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_MF_Dotplot_Reduced_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+      print(cnetplot(ego_mf_red, foldChange = fc_reduced, showCategory = 5) + ggtitle(paste("GO CNET MF Reduced -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GO_MF_CNET_Reduced_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+      results_list[[comp_name]]$ego_mf_red <- ego_mf_red
+    } else { print("No significant MF terms for Reduced proteins.") }
+  } else { print("Not enough genes for MF Reduced.") }
+  cat("\n\n")
+}
+```
+
+---
+
+## Part 3: Pathway Analysis (KEGG & Reactome)
+
+```{r pathway_analysis_setup, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, eval=FALSE}
+convert_to_entrez <- function(genes) {
+  res <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+  return(res$ENTREZID)
+}
+
+clean_pathway_results <- function(enrich_obj, exclude_kws = exclude_terms, cutoff = simplify_cutoff) {
+  if (is.null(enrich_obj) || nrow(as.data.frame(enrich_obj)) == 0) return(enrich_obj)
+  df <- as.data.frame(enrich_obj)
+  if (length(exclude_kws) > 0) {
+    pattern <- paste(exclude_kws, collapse = "|")
+    keep_idx_filter <- !grepl(pattern, df$Description, ignore.case = TRUE)
+    df <- df[keep_idx_filter, ]
+    enrich_obj@result <- enrich_obj@result[keep_idx_filter, ]
+  }
+  if (nrow(df) <= 1) {
+    if (nrow(as.data.frame(enrich_obj)) > 0) {
+      enrich_obj@result$Description <- stringr::str_wrap(enrich_obj@result$Description, width = 75)
+    }
+    return(enrich_obj)
+  }
+  df <- df[order(df$p.adjust), ]
+  keep_idx <- c(1)
+  if (nrow(df) > 1) {
+    for (i in 2:nrow(df)) {
+      genes_i <- unlist(strsplit(df$geneID[i], "/"))
+      is_redundant <- FALSE
+      for (j in keep_idx) {
+        genes_j <- unlist(strsplit(df$geneID[j], "/"))
+        jaccard <- length(intersect(genes_i, genes_j)) / length(union(genes_i, genes_j))
+        if (jaccard > cutoff) { is_redundant <- TRUE; break }
+      }
+      if (!is_redundant) keep_idx <- c(keep_idx, i)
+    }
+  }
+  enrich_obj@result <- enrich_obj@result[rownames(df)[keep_idx], ]
+  enrich_obj@result$Description <- stringr::str_wrap(enrich_obj@result$Description, width = 75)
+  return(enrich_obj)
+}
+```
+
+#### Pathways Enriched
+
+```{r pathway_enr, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, eval=FALSE, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### Pathways Enriched (", comp_name, ")\n\n"))
+  genes_enr <- data_list[[comp_name]]$genes_enr
+  fc_enriched <- data_list[[comp_name]]$fc_enriched
+  entrez_enr <- convert_to_entrez(genes_enr)
+
+  print(paste("Number of Entrez IDs for Pathways Enriched:", length(entrez_enr)))
+  if (length(entrez_enr) > 0) {
+    universe_entrez <- data_list[[comp_name]]$universe_entrez
+    kegg_enr <- NULL
+    for (attempt in 1:10) {
+      kegg_enr <- tryCatch({
+        enrichKEGG(gene = entrez_enr,
+                   universe = if (USE_CUSTOM_UNIVERSE && length(universe_entrez) > 0) universe_entrez else NULL,
+                   organism = "hsa", pvalueCutoff = 0.05)
+      }, error = function(e) {
+        message("KEGG server connection failed: ", e$message, " - Retrying (attempt ", attempt, "/10)...")
+        Sys.sleep(5)
+        NULL
+      })
+      if (!is.null(kegg_enr)) break
+    }
+    if (!is.null(kegg_enr) && nrow(as.data.frame(kegg_enr)) > 0) {
+      kegg_enr <- setReadable(kegg_enr, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+      kegg_enr <- clean_pathway_results(kegg_enr)
+      if (!is.null(kegg_enr) && nrow(as.data.frame(kegg_enr)) > 0) {
+        write.csv(as.data.frame(kegg_enr), file.path(out_dir, paste0("Ultimate_KEGG_Enriched_", comp_name, ".csv")), row.names = FALSE)
+        print(dotplot(kegg_enr, showCategory = 10, label_format = 75) + ggtitle(paste("KEGG Enriched -", comp_name)) + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_KEGG_Dotplot_Enriched_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+        print(cnetplot(kegg_enr, foldChange = fc_enriched, showCategory = 5) + ggtitle(paste("KEGG CNET Enriched -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_KEGG_CNET_Enriched_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+        results_list[[comp_name]]$kegg_enr <- kegg_enr
+      }
+    }
+    
+    reac_enr <- enrichPathway(gene = entrez_enr,
+                              universe = if (USE_CUSTOM_UNIVERSE && length(universe_entrez) > 0) universe_entrez else NULL,
+                              pvalueCutoff = 0.05, readable = TRUE)
+    if (!is.null(reac_enr) && nrow(as.data.frame(reac_enr)) > 0) {
+      reac_enr <- clean_pathway_results(reac_enr)
+      if (!is.null(reac_enr) && nrow(as.data.frame(reac_enr)) > 0) {
+        write.csv(as.data.frame(reac_enr), file.path(out_dir, paste0("Ultimate_Reactome_Enriched_", comp_name, ".csv")), row.names = FALSE)
+        print(dotplot(reac_enr, showCategory = 10, label_format = 75) + ggtitle(paste("Reactome Enriched -", comp_name)) + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_Reactome_Dotplot_Enriched_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+        print(cnetplot(reac_enr, foldChange = fc_enriched, showCategory = 5) + ggtitle(paste("Reactome CNET Enriched -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_Reactome_CNET_Enriched_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+        results_list[[comp_name]]$reac_enr <- reac_enr
+      }
+    }
+  } else { print("Not enough genes for Enriched Pathways.") }
+  cat("\n\n")
+}
+```
+
+#### Pathways Reduced
+
+```{r pathway_red, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, eval=FALSE, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### Pathways Reduced (", comp_name, ")\n\n"))
+  genes_red <- data_list[[comp_name]]$genes_red
+  fc_reduced <- data_list[[comp_name]]$fc_reduced
+  entrez_red <- convert_to_entrez(genes_red)
+
+  print(paste("Number of Entrez IDs for Pathways Reduced:", length(entrez_red)))
+  if (length(entrez_red) > 0) {
+    universe_entrez <- data_list[[comp_name]]$universe_entrez
+    kegg_red <- NULL
+    for (attempt in 1:10) {
+      kegg_red <- tryCatch({
+        enrichKEGG(gene = entrez_red,
+                   universe = if (USE_CUSTOM_UNIVERSE && length(universe_entrez) > 0) universe_entrez else NULL,
+                   organism = "hsa", pvalueCutoff = 0.05)
+      }, error = function(e) {
+        message("KEGG server connection failed: ", e$message, " - Retrying (attempt ", attempt, "/10)...")
+        Sys.sleep(5)
+        NULL
+      })
+      if (!is.null(kegg_red)) break
+    }
+    if (!is.null(kegg_red) && nrow(as.data.frame(kegg_red)) > 0) {
+      kegg_red <- setReadable(kegg_red, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+      kegg_red <- clean_pathway_results(kegg_red)
+      if (!is.null(kegg_red) && nrow(as.data.frame(kegg_red)) > 0) {
+        write.csv(as.data.frame(kegg_red), file.path(out_dir, paste0("Ultimate_KEGG_Reduced_", comp_name, ".csv")), row.names = FALSE)
+        print(dotplot(kegg_red, showCategory = 10, label_format = 75) + ggtitle(paste("KEGG Reduced -", comp_name)) + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_KEGG_Dotplot_Reduced_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+        print(cnetplot(kegg_red, foldChange = fc_reduced, showCategory = 5) + ggtitle(paste("KEGG CNET Reduced -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_KEGG_CNET_Reduced_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+        results_list[[comp_name]]$kegg_red <- kegg_red
+      }
+    }
+    
+    reac_red <- enrichPathway(gene = entrez_red,
+                              universe = if (USE_CUSTOM_UNIVERSE && length(universe_entrez) > 0) universe_entrez else NULL,
+                              pvalueCutoff = 0.05, readable = TRUE)
+    if (!is.null(reac_red) && nrow(as.data.frame(reac_red)) > 0) {
+      reac_red <- clean_pathway_results(reac_red)
+      if (!is.null(reac_red) && nrow(as.data.frame(reac_red)) > 0) {
+        write.csv(as.data.frame(reac_red), file.path(out_dir, paste0("Ultimate_Reactome_Reduced_", comp_name, ".csv")), row.names = FALSE)
+        print(dotplot(reac_red, showCategory = 10, label_format = 75) + ggtitle(paste("Reactome Reduced -", comp_name)) + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_Reactome_Dotplot_Reduced_", comp_name, ".png")), width = 14, height = 11, dpi = 300)
+        print(cnetplot(reac_red, foldChange = fc_reduced, showCategory = 5) + ggtitle(paste("Reactome CNET Reduced -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_Reactome_CNET_Reduced_", comp_name, ".png")), width = 16, height = 12, dpi = 300, bg = "white")
+        results_list[[comp_name]]$reac_red <- reac_red
+      }
+    }
+  } else { print("Not enough genes for Reduced Pathways.") }
+  cat("\n\n")
+}
+```
+
+### 3.1 Combined Functional Analysis (BP, KEGG, Reactome)
+
+```{r combined_ora_dotplot, message=FALSE, warning=FALSE, fig.width=12, fig.height=10, eval=FALSE, results='asis'}
+library(dplyr)
+library(ggplot2)
+
+plot_combined_ora <- function(res_list, title) {
+  df_all <- bind_rows(lapply(names(res_list), function(db_name) {
+    res <- res_list[[db_name]]
+    if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+      df <- as.data.frame(res)
+      df$Database <- db_name
+      if(is.null(df$Count) && !is.null(df$geneID)) {
+          df$Count <- sapply(strsplit(as.character(df$geneID), "/"), length)
+      }
+      df$GeneRatioNum <- sapply(df$GeneRatio, function(x) {
+        p <- as.numeric(strsplit(as.character(x), "/")[[1]])
+        if(length(p) == 2 && !is.na(p[2]) && p[2] != 0) p[1]/p[2] else 0
+      })
+      df <- df[order(df$p.adjust), ]
+      return(head(df, 15))
+    }
+    return(NULL)
+  }))
+  
+  if (nrow(df_all) == 0) return(NULL)
+  
+  df_all$Database <- factor(df_all$Database, levels = names(res_list))
+  df_all$Description <- stringr::str_wrap(df_all$Description, width = 75)
+  
+  p <- ggplot(df_all, aes(x = GeneRatioNum, y = reorder(Description, GeneRatioNum), color = p.adjust, size = Count)) +
+    geom_point() +
+    facet_grid(Database ~ ., scales = "free_y", space = "free_y") +
+    scale_color_continuous(low = "red", high = "blue") +
+    scale_size_continuous(range = c(2, 6)) +
+    theme_bw(base_size = 11) +
+    labs(title = title, x = "Gene Ratio", y = "") +
+    theme(strip.background = element_rect(fill = "lightgray"),
+          strip.text.y = element_text(angle = 270, face = "bold"),
+          panel.spacing = unit(0.2, "lines"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+  return(p)
+}
+
+for (comp_name in names(data_list)) {
+  cat(paste0("\n#### Combined ORA for ", comp_name, "\n\n"))
+  
+  # Enriched Combined
+  res_list_enr <- list()
+  if (!is.null(results_list[[comp_name]]$ego_bp_enr)) res_list_enr[["GO: BP"]] <- results_list[[comp_name]]$ego_bp_enr
+  if (!is.null(results_list[[comp_name]]$kegg_enr)) res_list_enr[["KEGG"]] <- results_list[[comp_name]]$kegg_enr
+  if (!is.null(results_list[[comp_name]]$reac_enr)) res_list_enr[["Reactome"]] <- results_list[[comp_name]]$reac_enr
+  
+  if (length(res_list_enr) > 0) {
+    p_enr <- plot_combined_ora(res_list_enr, paste("Combined Enriched Pathways -", comp_name))
+    if (!is.null(p_enr)) {
+      print(p_enr)
+      ggsave(file.path(out_dir, paste0("Ultimate_Combined_Dotplot_Enriched_", comp_name, ".png")), plot = p_enr, width = 12, height = 10, dpi = 300)
+    }
+  }
+  
+  # Reduced Combined
+  res_list_red <- list()
+  if (!is.null(results_list[[comp_name]]$ego_bp_red)) res_list_red[["GO: BP"]] <- results_list[[comp_name]]$ego_bp_red
+  if (!is.null(results_list[[comp_name]]$kegg_red)) res_list_red[["KEGG"]] <- results_list[[comp_name]]$kegg_red
+  if (!is.null(results_list[[comp_name]]$reac_red)) res_list_red[["Reactome"]] <- results_list[[comp_name]]$reac_red
+  
+  if (length(res_list_red) > 0) {
+    p_red <- plot_combined_ora(res_list_red, paste("Combined Reduced Pathways -", comp_name))
+    if (!is.null(p_red)) {
+      print(p_red)
+      ggsave(file.path(out_dir, paste0("Ultimate_Combined_Dotplot_Reduced_", comp_name, ".png")), plot = p_red, width = 12, height = 10, dpi = 300)
+    }
+  }
+  cat("\n\n")
+}
+```
+
+---
+
+## Part 4: Protein-Protein Interaction (PPI) Analysis via STRINGdb
+
+#### PPI Enriched
+
+```{r ppi_enr, message=FALSE, warning=FALSE, eval=FALSE, fig.width=10, fig.height=10, results='asis'}
+# Initialize STRING database object
+string_db <- STRINGdb$new(version = "12.0", species = 9606, score_threshold = 400, input_directory = "")
+
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### PPI Enriched (", comp_name, ")\n\n"))
+  df_enriched <- data_list[[comp_name]]$df_enriched
+  actual_col_gene <- data_list[[comp_name]]$actual_col_gene
+
+  print(paste("Number of proteins for PPI Enriched:", nrow(df_enriched)))
+  if (nrow(df_enriched) > 0) {
+    df_map_enr <- df_enriched %>% dplyr::rename(gene = !!sym(actual_col_gene))
+    mapped_enr <- string_db$map(df_map_enr, "gene", removeUnmappedRows = TRUE, quiet = TRUE)
+    
+    if (nrow(mapped_enr) > 2) {
+      interactions_enr <- string_db$get_interactions(mapped_enr$STRING_id)
+      write.csv(interactions_enr, file.path(out_dir, paste0("Ultimate_PPI_Interactions_Enriched_", comp_name, ".csv")), row.names = FALSE)
+      
+      g_enr <- graph_from_data_frame(interactions_enr, directed = FALSE)
+      hubs_enr <- sort(degree(g_enr), decreasing = TRUE)
+      
+      top_string_ids_enr <- names(hubs_enr)[1:min(length(hubs_enr), max_ppi_nodes)]
+      
+      print("Network Plot:")
+      png(file.path(out_dir, paste0("Ultimate_PPI_Network_Enriched_", comp_name, ".png")), width=10, height=10, units="in", res=300)
+      string_db$plot_network(top_string_ids_enr)
+      dev.off()
+      string_db$plot_network(top_string_ids_enr) # Print for RStudio
+      
+      hub_df_enr <- data.frame(STRING_id = names(hubs_enr), Degree = hubs_enr)
+      hub_merged_enr <- merge(hub_df_enr, mapped_enr[, c("STRING_id", "gene")], by = "STRING_id", all.x = TRUE) %>% arrange(desc(Degree)) %>% distinct(gene, .keep_all = TRUE)
+      write.csv(hub_merged_enr, file.path(out_dir, paste0("Ultimate_PPI_Hubs_Enriched_", comp_name, ".csv")), row.names = FALSE)
+      
+      print("Top Hub Proteins:")
+      print(kable(head(hub_merged_enr[, c("gene", "Degree")], 10), format = "markdown"))
+    }
+  } else { print("Not enough genes for Enriched PPI.") }
+  cat("\n\n")
+}
+```
+
+#### PPI Reduced
+
+```{r ppi_red, message=FALSE, warning=FALSE, eval=FALSE, fig.width=10, fig.height=10, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n##### PPI Reduced (", comp_name, ")\n\n"))
+  df_reduced <- data_list[[comp_name]]$df_reduced
+  actual_col_gene <- data_list[[comp_name]]$actual_col_gene
+
+  print(paste("Number of proteins for PPI Reduced:", nrow(df_reduced)))
+  if (nrow(df_reduced) > 0) {
+    df_map_red <- df_reduced %>% dplyr::rename(gene = !!sym(actual_col_gene))
+    mapped_red <- string_db$map(df_map_red, "gene", removeUnmappedRows = TRUE, quiet = TRUE)
+    
+    if (nrow(mapped_red) > 2) {
+      interactions_red <- string_db$get_interactions(mapped_red$STRING_id)
+      write.csv(interactions_red, file.path(out_dir, paste0("Ultimate_PPI_Interactions_Reduced_", comp_name, ".csv")), row.names = FALSE)
+      
+      g_red <- graph_from_data_frame(interactions_red, directed = FALSE)
+      hubs_red <- sort(degree(g_red), decreasing = TRUE)
+      
+      top_string_ids_red <- names(hubs_red)[1:min(length(hubs_red), max_ppi_nodes)]
+      
+      print("Network Plot:")
+      png(file.path(out_dir, paste0("Ultimate_PPI_Network_Reduced_", comp_name, ".png")), width=10, height=10, units="in", res=300)
+      string_db$plot_network(top_string_ids_red)
+      dev.off()
+      string_db$plot_network(top_string_ids_red) # Print for RStudio
+      
+      hub_df_red <- data.frame(STRING_id = names(hubs_red), Degree = hubs_red)
+      hub_merged_red <- merge(hub_df_red, mapped_red[, c("STRING_id", "gene")], by = "STRING_id", all.x = TRUE) %>% arrange(desc(Degree)) %>% distinct(gene, .keep_all = TRUE)
+      write.csv(hub_merged_red, file.path(out_dir, paste0("Ultimate_PPI_Hubs_Reduced_", comp_name, ".csv")), row.names = FALSE)
+      
+      print("Top Hub Proteins:")
+      print(kable(head(hub_merged_red[, c("gene", "Degree")], 10), format = "markdown"))
+    }
+  } else { print("Not enough genes for Reduced PPI.") }
+  cat("\n\n")
+}
+```
+
+---
+
+## Part 5: GSEA (Gene Set Enrichment Analysis)
+
+### Part 5.1 GSEA - GO Biological Process
+
+#### GSEA Dot Plot
+
+```{r gsea_analysis_dotplot, message=FALSE, warning=FALSE, fig.width=20, fig.height=16, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n#### GSEA BP (", comp_name, ")\n\n"))
+  gene_list <- data_list[[comp_name]]$gene_list
+
+  if (length(gene_list) < 100) {
+    print("Not enough genes for GSEA. Please ensure the input file contains all proteins, not just significant ones.")
+  } else {
+    gsea_bp <- gseGO(geneList = gene_list, OrgDb = org.Hs.eg.db, keyType = "SYMBOL",
+                     ont = "BP", pvalueCutoff = GSEA_FDR_THRESHOLD, pAdjustMethod = "BH",
+                     minGSSize = GSEA_MIN_SIZE, maxGSSize = GSEA_MAX_SIZE, verbose = FALSE)
+
+    if (!is.null(gsea_bp) && nrow(as.data.frame(gsea_bp)) > 0) {
+      gsea_bp_raw_df <- as.data.frame(gsea_bp)
+      gsea_bp_raw_df <- gsea_bp_raw_df[order(abs(gsea_bp_raw_df$NES), decreasing = TRUE), ]
+      write.csv(gsea_bp_raw_df, file.path(out_dir, paste0("Ultimate_GSEA_GO_BP_Unsimplified_", comp_name, ".csv")), row.names = FALSE)
+
+      gsea_bp <- clusterProfiler::simplify(gsea_bp, cutoff = 0.55, by = "p.adjust", select_fun = min)
+      
+      print(enrichplot::dotplot(gsea_bp, showCategory = 20, split = ".sign", label_format = 75) + facet_grid(. ~ .sign) + ggtitle(paste("GSEA GO BP -", comp_name)) + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GSEA_GO_BP_Dotplot_", comp_name, ".png")), width = 20, height = 16, dpi = 300)
+      print(cnetplot(gsea_bp, foldChange = gene_list, showCategory = 5) + ggtitle(paste("GSEA GO BP CNET -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+      ggsave(file.path(out_dir, paste0("Ultimate_GSEA_GO_BP_CNET_", comp_name, ".png")), width = 20, height = 16, dpi = 300, bg = "white")
+      
+      gsea_bp_df <- gsea_bp@result
+      gsea_bp_df <- gsea_bp_df[order(abs(gsea_bp_df$NES), decreasing = TRUE), ]
+      gsea_bp_df <- gsea_bp_df[!is.na(gsea_bp_df$ID), ]
+      
+      results_list[[comp_name]]$gsea_bp <- gsea_bp
+      results_list[[comp_name]]$gsea_bp_df <- gsea_bp_df
+    }
+  }
+  cat("\n\n")
+}
+```
+
+#### GSEA Barcode Plots
+
+```{r gsea_analysis_barcodes, message=FALSE, warning=FALSE, fig.width=10, fig.height=8, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n#### GSEA BP Barcodes (", comp_name, ")\n\n"))
+  gsea_bp <- results_list[[comp_name]]$gsea_bp
+  gsea_bp_df <- results_list[[comp_name]]$gsea_bp_df
+  gene_list <- data_list[[comp_name]]$gene_list
+
+  if (!is.null(gsea_bp_df) && nrow(gsea_bp_df) > 0) {
+      top_n_bp <- min(10, nrow(gsea_bp_df))
+      
+      invisible(lapply(1:top_n_bp, function(i) {
+        term_name <- gsea_bp@result$Description[i]
+        if (!is.na(term_name)) {
+          print(paste("GSEA Plot - GO BP:", term_name))
+          print(enrichplot::gseaplot2(gsea_bp, geneSetID = i, title = term_name, base_size = 10))
+          safe_name <- gsub("[^A-Za-z0-9]", "_", term_name)
+          ggsave(file.path(out_dir, paste0("Ultimate_GSEA_GO_BP_Barcode_", safe_name, "_", comp_name, ".png")), width = 10, height = 8, dpi = 300)
+        }
+      }))
+      
+      write.csv(as.data.frame(gsea_bp_df), file.path(out_dir, paste0("Ultimate_GSEA_GO_BP_Simplified_", comp_name, ".csv")), row.names = FALSE)
+  } else if (length(gene_list) >= 100) { print("No significant GSEA BP results.") }
+  cat("\n\n")
+}
+```
+
+#### Part 5.1.2 GeneSet HeatMap
+
+```{r, eval=FALSE, results='asis'}
+target_pathways <- c(
+  "protein deubiquitination",
+  "positive regulation of extrinsic apoptotic signaling pathway",
+  "positive regulation of interleukin-8 production",
+  "antiviral innate immune response"
+)
+
+for (comp_name in names(data_list)) {
+  gsea_bp_df <- results_list[[comp_name]]$gsea_bp_df
+  
+  if (!is.null(gsea_bp_df)) {
+    target_df <- gsea_bp_df[gsea_bp_df$Description %in% target_pathways, ]
+    
+    invisible(lapply(seq_len(nrow(target_df)), function(i) {
+      title <- target_df$Description[i]
+      specific_genes <- target_df$core_enrichment[i]
+      specific_genes <- unlist(strsplit(specific_genes, "/"))
+      
+      subset_matrix_1 <- de_data[de_data$`Gene.names` %in% specific_genes, ]
+      
+      if (nrow(subset_matrix_1) >= 8) {
+        subset_matrix_1 <- subset_matrix_1 %>% group_by(`Gene.names`) %>% summarize(across(all_of(sample_cols), mean, na.rm=TRUE)) %>% ungroup()
+        
+        expression_matrix <- as.matrix(subset_matrix_1[, sample_cols])
+        rownames(expression_matrix) <- subset_matrix_1$`Gene.names`
+        
+        graphical_data <- t(expression_matrix)
+        
+          ph <- pheatmap::pheatmap(graphical_data,
+                 cluster_rows = FALSE,   
+                 cluster_cols = TRUE,    
+                 border_color = "black", 
+                 main = paste(title, "-", comp_name),
+                 na_col = "white",
+                 scale = "column",
+                 color = colorRampPalette(c("blue", "purple", "red"))(50), 
+                 cellwidth = 12,         
+                 cellheight = 12,        
+                 fontsize = 8,
+                 fontsize_col = 9,       
+                 fontsize_row = 10,      
+                 legend = FALSE          
+        )
+      }
+    }))
+  }
+}
+```
+
+### Part 5.1 GSEA - KEGG Pathway
+
+#### KEGG Dot Plot
+
+```{r gsea_analysis_kegg_dotplot, message=FALSE, warning=FALSE, fig.width=20, fig.height=16, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n#### GSEA KEGG (", comp_name, ")\n\n"))
+  gene_list <- data_list[[comp_name]]$gene_list
+
+  if (length(gene_list) < 100) {
+    print("Not enough genes for GSEA. Please ensure the input file contains all proteins, not just significant ones.")
+  } else {
+    gene_ids <- bitr(names(gene_list), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+    entrez_list <- gene_list[gene_ids$SYMBOL]
+    names(entrez_list) <- gene_ids$ENTREZID
+    entrez_list <- entrez_list[!is.na(names(entrez_list)) & !is.na(entrez_list)]
+    entrez_list <- entrez_list[!duplicated(names(entrez_list))]
+    entrez_list <- sort(entrez_list, decreasing = TRUE)
+    
+    results_list[[comp_name]]$entrez_list <- entrez_list
+    
+    gsea_kegg <- NULL
+    for (attempt in 1:10) {
+      gsea_kegg <- tryCatch({
+        gseKEGG(geneList = entrez_list, organism = "hsa",
+                pvalueCutoff = GSEA_FDR_THRESHOLD, pAdjustMethod = "BH",
+                minGSSize = GSEA_MIN_SIZE, maxGSSize = GSEA_MAX_SIZE, verbose = FALSE)
+      }, error = function(e) {
+        message("KEGG server connection failed: ", e$message, " - Retrying (attempt ", attempt, "/10)...")
+        Sys.sleep(5)
+        NULL
+      })
+      if (!is.null(gsea_kegg)) break
+    }
+  
+    if (!is.null(gsea_kegg) && nrow(as.data.frame(gsea_kegg)) > 0) {
+      df_kegg <- as.data.frame(gsea_kegg)
+      pattern <- paste(exclude_terms, collapse = "|")
+      keep <- !grepl(pattern, df_kegg$Description, ignore.case = TRUE)
+      keep[is.na(keep)] <- FALSE
+      
+      gsea_kegg@result <- gsea_kegg@result[keep, ]
+      gsea_kegg@result <- gsea_kegg@result[order(abs(gsea_kegg@result$NES), decreasing = TRUE), ]
+      gsea_kegg@result <- gsea_kegg@result[!is.na(gsea_kegg@result$ID), ]
+      
+      if (nrow(as.data.frame(gsea_kegg)) > 0) {
+        print(enrichplot::dotplot(gsea_kegg, showCategory = 20, split = ".sign", label_format = 75) + facet_grid(. ~ .sign) + ggtitle(paste("GSEA KEGG -", comp_name)) + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_GSEA_KEGG_Dotplot_", comp_name, ".png")), width = 20, height = 16, dpi = 300)
+        print(cnetplot(setReadable(gsea_kegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID"), foldChange = gene_list, showCategory = 5) + ggtitle(paste("GSEA KEGG CNET -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_GSEA_KEGG_CNET_", comp_name, ".png")), width = 20, height = 16, dpi = 300, bg = "white")
+        
+        results_list[[comp_name]]$gsea_kegg <- gsea_kegg
+      }
+    }
+  }
+  cat("\n\n")
+}
+```
+
+### Part 5.3 GSEA - Reactome Pathway
+
+#### Reactome Dot Plot
+
+```{r gsea_analysis_reac_dotplot, message=FALSE, warning=FALSE, fig.width=14, fig.height=11, eval=FALSE, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n#### GSEA Reactome (", comp_name, ")\n\n"))
+  entrez_list <- results_list[[comp_name]]$entrez_list
+  gene_list <- data_list[[comp_name]]$gene_list
+
+  if (!is.null(entrez_list) && length(entrez_list) >= 10) {
+    gsea_reac <- tryCatch({
+      gsePathway(geneList = entrez_list, organism = "human",
+                 pvalueCutoff = GSEA_FDR_THRESHOLD, pAdjustMethod = "BH",
+                 minGSSize = GSEA_MIN_SIZE, maxGSSize = GSEA_MAX_SIZE, verbose = FALSE)
+    }, error = function(e) {
+      message("Reactome server connection failed: ", e$message)
+      NULL
+    })
+  
+    if (!is.null(gsea_reac) && nrow(as.data.frame(gsea_reac)) > 0) {
+      df_reac <- as.data.frame(gsea_reac)
+      pattern <- paste(exclude_terms, collapse = "|")
+      keep <- !grepl(pattern, df_reac$Description, ignore.case = TRUE)
+      keep[is.na(keep)] <- FALSE
+      
+      gsea_reac@result <- gsea_reac@result[keep, ]
+      gsea_reac@result <- gsea_reac@result[order(abs(gsea_reac@result$NES), decreasing = TRUE), ]
+      gsea_reac@result <- gsea_reac@result[!is.na(gsea_reac@result$ID), ]
+      
+      if (nrow(as.data.frame(gsea_reac)) > 0) {
+        print(enrichplot::dotplot(gsea_reac, showCategory = 20, split = ".sign", label_format = 75) + facet_grid(. ~ .sign) + ggtitle(paste("GSEA Reactome -", comp_name)) + theme(axis.text.y = element_text(size = 14, face = "bold"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_GSEA_Reactome_Dotplot_", comp_name, ".png")), width = 20, height = 16, dpi = 300)
+        print(cnetplot(setReadable(gsea_reac, OrgDb = org.Hs.eg.db, keyType = "ENTREZID"), foldChange = gene_list, showCategory = 5) + ggtitle(paste("GSEA Reactome CNET -", comp_name)) + theme(plot.margin = margin(1, 2, 1, 1, "cm"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+        ggsave(file.path(out_dir, paste0("Ultimate_GSEA_Reactome_CNET_", comp_name, ".png")), width = 20, height = 16, dpi = 300, bg = "white")
+        
+        results_list[[comp_name]]$gsea_reac <- gsea_reac
+      }
+    }
+  }
+  cat("\n\n")
+}
+```
+
+#### Reactome Barcode Plots
+
+```{r gsea_analysis_reac_barcodes, message=FALSE, warning=FALSE, fig.width=10, fig.height=8, eval=FALSE, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n#### GSEA Reactome Barcodes (", comp_name, ")\n\n"))
+  gsea_reac <- results_list[[comp_name]]$gsea_reac
+
+  if (!is.null(gsea_reac) && nrow(as.data.frame(gsea_reac)) > 0) {
+    top_n_reac <- min(10, nrow(gsea_reac@result))
+    
+    invisible(lapply(1:top_n_reac, function(i) {
+      term_id <- gsea_reac@result$ID[i]
+      term_name <- gsea_reac@result$Description[i]
+      if (!is.na(term_name)) {
+        print(paste("GSEA Plot - Reactome", comp_name, term_name))
+        print(enrichplot::gseaplot2(gsea_reac, geneSetID = term_id, title = term_name, base_size = 10))
+        safe_name <- gsub("[^A-Za-z0-9]", "_", term_name)
+        ggsave(file.path(out_dir, paste0("Ultimate_GSEA_Reactome_Barcode_", safe_name, "_", comp_name, ".png")), width = 10, height = 8, dpi = 300)
+      }
+    }))
+    
+    gsea_reac_readable <- setReadable(gsea_reac, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    df_reac_2 <- as.data.frame(gsea_reac_readable)
+    write.csv(df_reac_2, file.path(out_dir, paste0("Ultimate_GSEA_Reactome_", comp_name, ".csv")), row.names = FALSE)
+  } else { print("No significant GSEA Reactome results.") }
+  cat("\n\n")
+}
+```
+
+### Part 5.4 Combined GSEA Dotplot (BP, KEGG, Reactome)
+
+```{r gsea_combined_dotplot, message=FALSE, warning=FALSE, fig.width=12, fig.height=10, eval=FALSE, results='asis'}
+plot_combined_gsea <- function(res_list, title) {
+  df_all <- bind_rows(lapply(names(res_list), function(db_name) {
+    res <- res_list[[db_name]]
+    if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+      df <- as.data.frame(res)
+      df$Database <- db_name
+      df$.sign <- ifelse(df$NES > 0, "activated", "suppressed")
+      
+      df_act <- df %>% filter(.sign == "activated") %>% arrange(p.adjust) %>% head(15)
+      df_sup <- df %>% filter(.sign == "suppressed") %>% arrange(p.adjust) %>% head(15)
+      
+      return(bind_rows(df_act, df_sup))
+    }
+    return(NULL)
+  }))
+  
+  if (nrow(df_all) == 0) return(NULL)
+  
+  df_all$Database <- factor(df_all$Database, levels = names(res_list))
+  df_all$Description <- stringr::str_wrap(df_all$Description, width = 75)
+  
+  p <- ggplot(df_all, aes(x = NES, y = reorder(Description, NES), color = p.adjust, size = setSize)) +
+    geom_point() +
+    facet_grid(Database ~ .sign, scales = "free_y", space = "free_y") +
+    scale_color_continuous(low = "red", high = "blue") +
+    scale_size_continuous(range = c(2, 6)) +
+    theme_bw(base_size = 11) +
+    labs(title = title, x = "Normalized Enrichment Score (NES)", y = "") +
+    theme(strip.background = element_rect(fill = "lightgray"),
+          strip.text = element_text(face = "bold"),
+          strip.text.y = element_text(angle = 270),
+          panel.spacing = unit(0.2, "lines"), plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+  return(p)
+}
+
+for (comp_name in names(data_list)) {
+  cat(paste0("\n#### Combined GSEA for ", comp_name, "\n\n"))
+  
+  gsea_list <- list()
+  if (!is.null(results_list[[comp_name]]$gsea_bp)) gsea_list[["GO: BP"]] <- results_list[[comp_name]]$gsea_bp
+  if (!is.null(results_list[[comp_name]]$gsea_kegg)) gsea_list[["KEGG"]] <- results_list[[comp_name]]$gsea_kegg
+  if (!is.null(results_list[[comp_name]]$gsea_reac)) gsea_list[["Reactome"]] <- results_list[[comp_name]]$gsea_reac
+  
+  if (length(gsea_list) > 0) {
+    p_gsea <- plot_combined_gsea(gsea_list, paste("Combined GSEA -", comp_name))
+    if (!is.null(p_gsea)) {
+      print(p_gsea)
+      ggsave(file.path(out_dir, paste0("Ultimate_Combined_GSEA_Dotplot_", comp_name, ".png")), plot = p_gsea, width = 12, height = 10, dpi = 300)
+    }
+  }
+  cat("\n\n")
+}
+```
+
+#### KEGG Barcode Plots
+
+```{r gsea_analysis_kegg_barcodes, message=FALSE, warning=FALSE, fig.width=10, fig.height=8, eval=FALSE, results='asis'}
+for (comp_name in names(data_list)) {
+  cat(paste0("\n#### GSEA KEGG Barcodes (", comp_name, ")\n\n"))
+  gsea_kegg <- results_list[[comp_name]]$gsea_kegg
+  gene_list <- data_list[[comp_name]]$gene_list
+
+  if (!is.null(gsea_kegg) && nrow(as.data.frame(gsea_kegg)) > 0) {
+    top_n_kegg <- min(10, nrow(gsea_kegg@result))
+    
+    invisible(lapply(1:top_n_kegg, function(i) {
+      term_id <- gsea_kegg@result$ID[i]
+      term_name <- gsea_kegg@result$Description[i]
+      if (!is.na(term_name)) {
+        print(paste("GSEA Plot - KEGG", comp_name, term_name))
+        print(enrichplot::gseaplot2(gsea_kegg, geneSetID = term_id, title = term_name, base_size = 10))
+        safe_name <- gsub("[^A-Za-z0-9]", "_", term_name)
+        ggsave(file.path(out_dir, paste0("Ultimate_GSEA_KEGG_Barcode_", safe_name, "_", comp_name, ".png")), width = 10, height = 8, dpi = 300)
+      }
+    }))
+    
+    gsea_kegg <- setReadable(gsea_kegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    df_kegg_2 <- as.data.frame(gsea_kegg)
+    write.csv(df_kegg_2, file.path(out_dir, paste0("Ultimate_GSEA_KEGG_", comp_name, ".csv")), row.names = FALSE)
+    results_list[[comp_name]]$df_kegg_2 <- df_kegg_2
+  } else if (length(gene_list) >= 100) { print("No significant GSEA KEGG results after filtering.") }
+  cat("\n\n")
+}
+```
+
+#### Part 5.2.2 GeneSet HeatMap KEGG
+  
+```{r,eval=FALSE, results='asis'}
+for (comp_name in names(data_list)) {
+  df_kegg_2 <- results_list[[comp_name]]$df_kegg_2
+  
+  if(!is.null(df_kegg_2) && nrow(df_kegg_2) > 0) {
+    df_kegg_2 <- df_kegg_2[order(abs(df_kegg_2$NES), decreasing = TRUE), ]
+    top_n_kegg <- min(10, nrow(df_kegg_2))
+    
+    invisible(lapply(1:top_n_kegg, function(i) {
+      title <- df_kegg_2$Description[i]
+      specific_genes <- df_kegg_2$core_enrichment[i]
+      specific_genes <- unlist(strsplit(specific_genes, "/"))
+      
+      subset_matrix_1 <- de_data[de_data$`Gene.names` %in% specific_genes, ]
+      
+      if (nrow(subset_matrix_1) >= 8) {
+        subset_matrix_1 <- subset_matrix_1 %>% group_by(`Gene.names`) %>% summarize(across(all_of(sample_cols), mean, na.rm=TRUE)) %>% ungroup()
+        
+        expression_matrix <- as.matrix(subset_matrix_1[, sample_cols])
+        rownames(expression_matrix) <- subset_matrix_1$`Gene.names`
+        
+        graphical_data <- t(expression_matrix)
+        
+        ph <- pheatmap::pheatmap(graphical_data,
+                 cluster_rows = FALSE,   
+                 cluster_cols = TRUE,    
+                 border_color = "black", 
+                 main = paste(title, "-", comp_name),
+                 na_col = "white",
+                 scale = "column",
+                 color = colorRampPalette(c("blue", "purple", "red"))(50), 
+                 cellwidth = 12,         
+                 cellheight = 12,        
+                 fontsize = 8,
+                 fontsize_col = 9,       
+                 fontsize_row = 10,
+                 legend = FALSE
+        )
+      }
+    }))
+  }
+}
+```
